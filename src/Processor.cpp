@@ -44,6 +44,7 @@ MorphProcessor::MorphProcessor()
     {
         waypointX[(size_t) i].store (0.5f);
         waypointY[(size_t) i].store (0.5f);
+        waypointRadius[(size_t) i].store (0.34f);
     }
 }
 
@@ -65,6 +66,8 @@ MorphProcessor::APVTS::ParameterLayout MorphProcessor::layout()
                                                            juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.5f));
     out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "radius", 1 }, "Influence Radius",
                                                            juce::NormalisableRange<float> (0.08f, 0.75f, 0.0001f), 0.34f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "strength", 1 }, "Transform Strength",
+                                                           juce::NormalisableRange<float> (0.0f, 200.0f, 0.1f), 155.0f));
     out.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "realtime", 1 }, "Realtime Mode", true));
     out.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "quality", 1 }, "Quality",
                                                             juce::StringArray { "Lowest Latency", "Lower Latency", "Higher Quality", "Highest Quality" }, 1));
@@ -92,6 +95,13 @@ void MorphProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
         smoothedBandDb[(size_t) i].reset (sampleRate, 0.06);
         smoothedBandDb[(size_t) i].setCurrentAndTargetValue (0.0f);
     }
+
+    bodyShelf.prepare (spec);
+    presenceShelf.prepare (spec);
+    airShelf.prepare (spec);
+    bodyShelf.reset();
+    presenceShelf.reset();
+    airShelf.reset();
 
     pitchShifter.prepare (sampleRate, samplesPerBlock, channels);
     dryBuffer.setSize (channels, samplesPerBlock, false, false, true);
@@ -183,12 +193,50 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
     const float y = midiMorphOverride.load() ? midiMorphY.load() : parameters.getRawParameterValue ("morphY")->load();
     const float radius = midiMorphOverride.load() ? midiRadius.load() : parameters.getRawParameterValue ("radius")->load();
 
-    updateFilterTargets (computeMorphBandGains (x, y, radius));
+    auto targetBandDb = computeMorphBandGains (x, y, radius);
+    const float strength = parameters.getRawParameterValue ("strength")->load() * 0.01f;
+
+    for (auto& value : targetBandDb)
+        value = juce::jlimit (-24.0f, 24.0f, value * strength);
+
+    updateFilterTargets (targetBandDb);
+
+    const float bodyDb = juce::jlimit (-12.0f, 12.0f,
+        (targetBandDb[0] + targetBandDb[1] + targetBandDb[2]) / 3.0f * 0.72f);
+    const float presenceDb = juce::jlimit (-12.0f, 12.0f,
+        (targetBandDb[5] + targetBandDb[6] + targetBandDb[7]) / 3.0f * 0.72f);
+    const float airDb = juce::jlimit (-10.0f, 10.0f,
+        (targetBandDb[8] + targetBandDb[9]) * 0.35f);
+
+    *bodyShelf.state = *juce::dsp::IIR::Coefficients<float>::makeLowShelf (
+        currentSampleRate, 220.0, 0.72, juce::Decibels::decibelsToGain (bodyDb));
+    *presenceShelf.state = *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+        currentSampleRate, juce::jmin (2400.0, currentSampleRate * 0.40), 0.72,
+        juce::Decibels::decibelsToGain (presenceDb));
+    *airShelf.state = *juce::dsp::IIR::Coefficients<float>::makeHighShelf (
+        currentSampleRate, juce::jmin (7000.0, currentSampleRate * 0.40), 0.72,
+        juce::Decibels::decibelsToGain (airDb));
 
     juce::dsp::AudioBlock<float> block (buffer);
     juce::dsp::ProcessContextReplacing<float> context (block);
     for (auto& filter : bandFilters)
         filter.process (context);
+    bodyShelf.process (context);
+    presenceShelf.process (context);
+    airShelf.process (context);
+
+    if (strength > 1.0f)
+    {
+        const float drive = 1.0f + (strength - 1.0f) * 1.6f;
+        const float normalise = 1.0f / std::tanh (drive);
+
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            auto* samples = buffer.getWritePointer (ch);
+            for (int s = 0; s < numSamples; ++s)
+                samples[s] = std::tanh (samples[s] * drive) * normalise;
+        }
+    }
 
     const float wet = parameters.getRawParameterValue ("mix")->load() * 0.01f;
     const float dry = 1.0f - wet;
@@ -398,7 +446,7 @@ std::optional<VoiceProfile> MorphProcessor::analyseVoiceFile (const juce::File& 
     meanDb /= (float) VoiceProfile::bandCount;
 
     for (int i = 0; i < VoiceProfile::bandCount; ++i)
-        profile.bandDb[(size_t) i] = juce::jlimit (-12.0f, 12.0f, (db[(size_t) i] - meanDb) * 0.72f);
+        profile.bandDb[(size_t) i] = juce::jlimit (-18.0f, 18.0f, (db[(size_t) i] - meanDb) * 1.42f);
 
     if (! pitches.empty())
     {
@@ -475,7 +523,8 @@ void MorphProcessor::addGeneratedVoice (juce::String hexCode, float voiceSpace, 
         const float toneCurve = std::sin ((float) i * 0.78f
                                         + tone * juce::MathConstants<float>::twoPi) * 2.8f;
         const float randomShape = (random.nextFloat() - 0.5f) * 4.5f;
-        p.bandDb[(size_t) i] = juce::jlimit (-10.0f, 10.0f, spectralTilt + toneCurve + randomShape);
+        p.bandDb[(size_t) i] = juce::jlimit (-16.0f, 16.0f,
+            spectralTilt * 1.75f + toneCurve * 1.45f + randomShape * 1.25f);
     }
 
     const juce::ScopedLock lock (profilesLock);
@@ -541,6 +590,7 @@ void MorphProcessor::addWaypointFromCurrent()
 
     waypointX[(size_t) count].store (parameters.getRawParameterValue ("morphX")->load());
     waypointY[(size_t) count].store (parameters.getRawParameterValue ("morphY")->load());
+    waypointRadius[(size_t) count].store (parameters.getRawParameterValue ("radius")->load());
     waypointCount.store (count + 1);
     activeWaypoint.store (count);
 }
@@ -559,6 +609,14 @@ juce::Point<float> MorphProcessor::getWaypoint (int index) const
     return { waypointX[(size_t) index].load(), waypointY[(size_t) index].load() };
 }
 
+float MorphProcessor::getWaypointRadius (int index) const
+{
+    if (! juce::isPositiveAndBelow (index, waypointCount.load()))
+        return 0.34f;
+
+    return waypointRadius[(size_t) index].load();
+}
+
 void MorphProcessor::activateWaypoint (int index)
 {
     if (! juce::isPositiveAndBelow (index, waypointCount.load()))
@@ -566,6 +624,7 @@ void MorphProcessor::activateWaypoint (int index)
 
     const auto p = getWaypoint (index);
     setMorphPointFromUI (p.x, p.y);
+    setInfluenceFromUI (getWaypointRadius (index));
     activeWaypoint.store (index);
 }
 
@@ -609,6 +668,7 @@ void MorphProcessor::getStateInformation (juce::MemoryBlock& destData)
         juce::ValueTree point { "POINT" };
         point.setProperty ("x", waypointX[(size_t) i].load(), nullptr);
         point.setProperty ("y", waypointY[(size_t) i].load(), nullptr);
+        point.setProperty ("radius", waypointRadius[(size_t) i].load(), nullptr);
         waypointsTree.addChild (point, -1, nullptr);
     }
     waypointsTree.setProperty ("active", activeWaypoint.load(), nullptr);
@@ -659,6 +719,7 @@ void MorphProcessor::setStateInformation (const void* data, int sizeInBytes)
             const auto point = waypointsTree.getChild (i);
             waypointX[(size_t) i].store ((float) point.getProperty ("x", 0.5));
             waypointY[(size_t) i].store ((float) point.getProperty ("y", 0.5));
+            waypointRadius[(size_t) i].store ((float) point.getProperty ("radius", 0.34));
         }
 
         waypointCount.store (count);
