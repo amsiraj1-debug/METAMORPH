@@ -217,7 +217,8 @@ bool DnniModelBackend::createSession()
     if (! modelIsValid || createFn == nullptr || preparedSampleRate <= 0.0)
         return false;
 
-    const auto modelPath = selectedModel.getFullPathName().toUTF8();
+    const auto modelPathString = selectedModel.getFullPathName();
+    const auto modelPath = modelPathString.toUTF8();
     session = createFn (modelPath.getAddress(),
                         preparedSampleRate,
                         preparedMaximumBlockSize,
