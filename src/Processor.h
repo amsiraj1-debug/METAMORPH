@@ -56,6 +56,7 @@ public:
     int getWaypointCount() const noexcept { return waypointCount.load(); }
     int getActiveWaypoint() const noexcept { return activeWaypoint.load(); }
     juce::Point<float> getWaypoint (int index) const;
+    float getWaypointRadius (int index) const;
 
     float getInputMeter() const noexcept { return inputMeter.load(); }
     float getOutputMeter() const noexcept { return outputMeter.load(); }
@@ -76,6 +77,9 @@ private:
     std::vector<VoiceProfile> profiles;
 
     std::array<BandFilter, VoiceProfile::bandCount> bandFilters;
+    BandFilter bodyShelf;
+    BandFilter presenceShelf;
+    BandFilter airShelf;
     std::array<juce::SmoothedValue<float>, VoiceProfile::bandCount> smoothedBandDb;
     DualDelayPitchShifter pitchShifter;
     juce::AudioBuffer<float> dryBuffer;
@@ -84,6 +88,7 @@ private:
 
     std::array<std::atomic<float>, 8> waypointX {};
     std::array<std::atomic<float>, 8> waypointY {};
+    std::array<std::atomic<float>, 8> waypointRadius {};
     std::atomic<int> waypointCount { 0 };
     std::atomic<int> activeWaypoint { -1 };
 
