@@ -44,3 +44,10 @@ cmake --build build --config Release --target MetamorphRebuild_VST3
 The VST3 is written to `build/MetamorphRebuild_artefacts/Release/VST3`.
 
 GitHub Actions uploads the Windows VST3 bundle and standalone EXE as **Metamorph-CR-Windows-x64**.
+
+
+## Reference Match v0.4
+
+Transform Strength has been replaced conceptually by **Voice Match**. The 0-200% control no longer drives a saturation stage or intentionally raises output level. The processor now analyzes the live input spectrum, compares it with the active reference-voice spectrum, and applies the spectral difference. A smoothed RMS compensation stage keeps the wet path close to the dry/input loudness before Dry/Wet mixing.
+
+The Windows regression build verifies that 200% Voice Match remains audibly different from the source, stays within the configured RMS tolerance, remains below the clipping ceiling in the smoke test, and preserves waypoint/MIDI recall behavior.
