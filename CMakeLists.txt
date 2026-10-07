@@ -44,6 +44,8 @@ target_sources(MetamorphRebuild PRIVATE
   src/VoiceProfile.cpp
   src/VoiceProfile.h
   src/PitchShifter.h
+  src/DnniBackend.cpp
+  src/DnniBackend.h
 )
 
 target_compile_definitions(MetamorphRebuild PUBLIC
@@ -81,6 +83,8 @@ target_sources(MetamorphCoreTests PRIVATE
   src/VoiceProfile.cpp
   src/VoiceProfile.h
   src/PitchShifter.h
+  src/DnniBackend.cpp
+  src/DnniBackend.h
 )
 
 target_compile_definitions(MetamorphCoreTests PUBLIC
