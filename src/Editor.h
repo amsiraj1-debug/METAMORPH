@@ -43,6 +43,7 @@ private:
     void configureSlider (juce::Slider& slider, const juce::String& suffix = {});
     void updateVoiceList();
     void chooseReferenceFile();
+    void chooseDnniModel();
     void showStatus (const juce::String& text);
 
     MorphProcessor& processor;
@@ -53,6 +54,7 @@ private:
     juce::Label statusLabel;
     juce::Label latencyLabel;
     juce::Label waypointInfoLabel;
+    juce::Label dnniStatusLabel;
 
     juce::Slider preGainSlider;
     juce::Slider pitchSlider;
@@ -81,9 +83,12 @@ private:
     juce::TextButton previousWaypointButton { "<" };
     juce::TextButton nextWaypointButton { ">" };
     juce::TextButton clearWaypointsButton { "CLEAR WP" };
+    juce::TextButton loadDnniButton { "LOAD DNNI MODEL" };
+    juce::TextButton clearDnniButton { "CLEAR MODEL" };
     std::array<juce::TextButton, 8> waypointButtons;
 
     std::unique_ptr<juce::FileChooser> chooser;
+    std::unique_ptr<juce::FileChooser> modelChooser;
 
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ComboAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
@@ -101,6 +106,7 @@ private:
     std::unique_ptr<ButtonAttachment> bypassAttachment;
 
     int lastVoiceCount { -1 };
+    juce::String lastDnniStatus;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MorphEditor)
 };
