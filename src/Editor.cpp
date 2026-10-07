@@ -52,13 +52,9 @@ void MorphCanvas::paint (juce::Graphics& g)
     }
 
     const auto profiles = processor.getProfilesSnapshot();
-    const juce::Point<float> cursorNorm {
-        processor.parameters.getRawParameterValue ("morphX")->load(),
-        processor.parameters.getRawParameterValue ("morphY")->load()
-    };
-
+    const auto cursorNorm = processor.getEffectiveMorphPoint();
     const auto cursor = fromNormalised (cursorNorm);
-    const float radiusNorm = processor.parameters.getRawParameterValue ("radius")->load();
+    const float radiusNorm = processor.getEffectiveRadius();
     const float radiusPx = radiusNorm * juce::jmin (bounds.getWidth(), bounds.getHeight());
 
     for (const auto& profile : profiles)
@@ -271,7 +267,7 @@ MorphEditor::MorphEditor (MorphProcessor& p)
 {
     setSize (1120, 720);
     setResizable (true, true);
-    setResizeLimits (900, 600, 1500, 1000);
+    setResizeLimits (1040, 650, 1500, 1000);
 
     titleLabel.setText ("METAMORPH CR", juce::dontSendNotification);
     titleLabel.setFont (juce::Font (juce::FontOptions (22.0f, juce::Font::bold)));
