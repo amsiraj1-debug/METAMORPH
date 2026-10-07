@@ -1,5 +1,7 @@
 #pragma once
 #include <JuceHeader.h>
+#include "DnniReader.h"
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -18,17 +20,27 @@ public:
     bool process (juce::AudioBuffer<float>& buffer);
 
     bool hasModel() const noexcept { return modelIsValid; }
-    bool isReady() const noexcept { return session != nullptr && processFn != nullptr; }
+    bool isReady() const noexcept { return nativeReady || isFullGraphReady(); }
+    bool isFullGraphReady() const noexcept { return session != nullptr && processFn != nullptr; }
+    bool isNativeReady() const noexcept { return nativeReady; }
 
     juce::File getModelFile() const;
     juce::String getStatus() const;
     juce::String getBridgePath() const;
+    int getNativeRecordCount() const noexcept { return nativeModel.recordCount; }
+    int getNativeMatrixCount() const noexcept { return (int) nativeModel.quantMatrices.size(); }
+    int getNativeVectorCount() const noexcept { return (int) nativeModel.floatVectors.size(); }
+    int getNativeConvCount() const noexcept { return (int) nativeModel.conv1dOps.size(); }
 
     static constexpr juce::int64 expectedModelSize = 87529366;
     static constexpr const char* expectedSha256 =
         "48fe10df60bb4d92d2a5f19f02b4d712dc070bebba9d5ea1ef2172d9f82a428c";
 
 private:
+    using BandFilter = juce::dsp::ProcessorDuplicator<
+        juce::dsp::IIR::Filter<float>,
+        juce::dsp::IIR::Coefficients<float>>;
+
     using CreateFn = void* (*) (const char* modelPathUtf8,
                                 double sampleRate,
                                 int maximumBlockSize,
@@ -42,15 +54,27 @@ private:
     using LastErrorFn = const char* (*) (void* session);
 
     bool validateModelFile (const juce::File&, juce::String& errorMessage) const;
+    bool loadNativeModel (const juce::File&, juce::String& errorMessage);
+    void prepareNativeFilters();
+    void updateNativeFilterCoefficients();
+
     bool loadBridge();
     bool createSession();
     void destroySession();
     void setStatus (juce::String text);
+    juce::String nativeSummary() const;
 
     mutable juce::CriticalSection stateLock;
     juce::File selectedModel;
     juce::String status { "No DNnI model loaded" };
     juce::String bridgePath;
+
+    DnniReader nativeReader;
+    DnniNativeModelInfo nativeModel;
+    std::array<float, 10> nativeSignatureDb {};
+    std::array<BandFilter, 10> nativeFilters;
+    bool nativeReady { false };
+    bool nativePrepared { false };
 
     std::unique_ptr<juce::DynamicLibrary> bridge;
     CreateFn createFn { nullptr };
