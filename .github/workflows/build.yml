@@ -20,9 +20,9 @@ jobs:
         shell: pwsh
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
-      - name: Build VST3, Standalone and regression tests
+      - name: Build VST3, Standalone, DNnI inspector and regression tests
         shell: pwsh
-        run: cmake --build build --config Release --target MetamorphRebuild_VST3 MetamorphRebuild_Standalone MetamorphCoreTests --parallel 2
+        run: cmake --build build --config Release --target MetamorphRebuild_VST3 MetamorphRebuild_Standalone MetamorphCoreTests DnniInspector DnniReaderTests --parallel 2
 
       - name: Test audible morphing and waypoint recall
         shell: pwsh
@@ -34,6 +34,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item -Recurse -Force "build/MetamorphRebuild_artefacts/Release/VST3/Metamorph CR.vst3" "dist/Metamorph CR.vst3"
           Copy-Item -Force "build/MetamorphRebuild_artefacts/Release/Standalone/Metamorph CR.exe" "dist/Metamorph CR.exe"
+          Copy-Item -Force "build/DnniInspector_artefacts/Release/Metamorph DNnI Inspector.exe" "dist/DnniInspector.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
