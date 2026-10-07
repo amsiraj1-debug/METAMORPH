@@ -105,6 +105,15 @@ void MorphProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     pitchShifter.prepare (sampleRate, samplesPerBlock, channels);
     dryBuffer.setSize (channels, samplesPerBlock, false, false, true);
+
+    liveAnalysisRing.fill (0.0f);
+    liveFftData.fill (0.0f);
+    liveSourceBandDb.fill (0.0f);
+    liveAnalysisWrite = 0;
+    liveAnalysisFill = 0;
+
+    loudnessCompensation.reset (sampleRate, 0.08);
+    loudnessCompensation.setCurrentAndTargetValue (1.0f);
 }
 
 bool MorphProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -122,6 +131,86 @@ float MorphProcessor::computePeak (const juce::AudioBuffer<float>& buffer)
     for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
         peak = juce::jmax (peak, buffer.getMagnitude (ch, 0, buffer.getNumSamples()));
     return peak;
+}
+
+float MorphProcessor::computeRms (const juce::AudioBuffer<float>& buffer)
+{
+    if (buffer.getNumChannels() == 0 || buffer.getNumSamples() == 0)
+        return 0.0f;
+
+    double sumSquares = 0.0;
+    const double count = (double) buffer.getNumChannels() * (double) buffer.getNumSamples();
+
+    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+    {
+        const auto* samples = buffer.getReadPointer (ch);
+        for (int s = 0; s < buffer.getNumSamples(); ++s)
+            sumSquares += (double) samples[s] * (double) samples[s];
+    }
+
+    return (float) std::sqrt (sumSquares / juce::jmax (1.0, count));
+}
+
+void MorphProcessor::updateLiveSourceSpectrum (const juce::AudioBuffer<float>& source)
+{
+    const int channels = juce::jmax (1, source.getNumChannels());
+
+    for (int s = 0; s < source.getNumSamples(); ++s)
+    {
+        float mono = 0.0f;
+        for (int ch = 0; ch < source.getNumChannels(); ++ch)
+            mono += source.getSample (ch, s);
+        mono /= (float) channels;
+
+        liveAnalysisRing[(size_t) liveAnalysisWrite] = mono;
+        liveAnalysisWrite = (liveAnalysisWrite + 1) % liveFftSize;
+        liveAnalysisFill = juce::jmin (liveFftSize, liveAnalysisFill + 1);
+    }
+
+    if (liveAnalysisFill < liveFftSize)
+        return;
+
+    liveFftData.fill (0.0f);
+
+    for (int i = 0; i < liveFftSize; ++i)
+    {
+        const int index = (liveAnalysisWrite + i) % liveFftSize;
+        liveFftData[(size_t) i] = liveAnalysisRing[(size_t) index];
+    }
+
+    liveWindow.multiplyWithWindowingTable (liveFftData.data(), liveFftSize);
+    liveFft.performFrequencyOnlyForwardTransform (liveFftData.data());
+
+    std::array<float, VoiceProfile::bandCount> currentDb {};
+    float meanDb = 0.0f;
+
+    for (int band = 0; band < VoiceProfile::bandCount; ++band)
+    {
+        const int lo = juce::jlimit (1, liveFftSize / 2 - 1,
+            (int) std::floor (bandEdges[(size_t) band] * liveFftSize / currentSampleRate));
+        const int hi = juce::jlimit (lo + 1, liveFftSize / 2,
+            (int) std::ceil (bandEdges[(size_t) band + 1] * liveFftSize / currentSampleRate));
+
+        double energy = 0.0;
+        for (int bin = lo; bin < hi; ++bin)
+        {
+            const double magnitude = liveFftData[(size_t) bin];
+            energy += magnitude * magnitude;
+        }
+
+        currentDb[(size_t) band] =
+            (float) (10.0 * std::log10 (energy / (double) juce::jmax (1, hi - lo) + 1.0e-12));
+        meanDb += currentDb[(size_t) band];
+    }
+
+    meanDb /= (float) VoiceProfile::bandCount;
+
+    for (int band = 0; band < VoiceProfile::bandCount; ++band)
+    {
+        const float centred = juce::jlimit (-18.0f, 18.0f, (currentDb[(size_t) band] - meanDb) * 0.90f);
+        liveSourceBandDb[(size_t) band] =
+            0.82f * liveSourceBandDb[(size_t) band] + 0.18f * centred;
+    }
 }
 
 void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
@@ -155,6 +244,8 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
 
     for (int ch = 0; ch < numChannels; ++ch)
         dryBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
+
+    updateLiveSourceSpectrum (dryBuffer);
 
     for (const auto metadata : midi)
     {
@@ -217,20 +308,32 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
     const float y = midiMorphOverride.load() ? midiMorphY.load() : parameters.getRawParameterValue ("morphY")->load();
     const float radius = midiMorphOverride.load() ? midiRadius.load() : parameters.getRawParameterValue ("radius")->load();
 
-    auto targetBandDb = computeMorphBandGains (x, y, radius);
+    const auto targetProfileDb = computeMorphBandGains (x, y, radius);
     const float strength = parameters.getRawParameterValue ("strength")->load() * 0.01f;
 
-    for (auto& value : targetBandDb)
-        value = juce::jlimit (-24.0f, 24.0f, value * strength);
+    std::array<float, VoiceProfile::bandCount> matchBandDb {};
+    for (int band = 0; band < VoiceProfile::bandCount; ++band)
+    {
+        const float spectralDifference = targetProfileDb[(size_t) band] - liveSourceBandDb[(size_t) band];
+        matchBandDb[(size_t) band] = juce::jlimit (-18.0f, 18.0f, spectralDifference * strength);
+    }
 
-    updateFilterTargets (targetBandDb);
+    float correctionMean = 0.0f;
+    for (const auto value : matchBandDb)
+        correctionMean += value;
+    correctionMean /= (float) VoiceProfile::bandCount;
 
-    const float bodyDb = juce::jlimit (-12.0f, 12.0f,
-        (targetBandDb[0] + targetBandDb[1] + targetBandDb[2]) / 3.0f * 0.72f);
-    const float presenceDb = juce::jlimit (-12.0f, 12.0f,
-        (targetBandDb[5] + targetBandDb[6] + targetBandDb[7]) / 3.0f * 0.72f);
-    const float airDb = juce::jlimit (-10.0f, 10.0f,
-        (targetBandDb[8] + targetBandDb[9]) * 0.35f);
+    for (auto& value : matchBandDb)
+        value -= correctionMean;
+
+    updateFilterTargets (matchBandDb);
+
+    const float bodyDb = juce::jlimit (-9.0f, 9.0f,
+        (matchBandDb[0] + matchBandDb[1] + matchBandDb[2]) / 3.0f * 0.48f);
+    const float presenceDb = juce::jlimit (-9.0f, 9.0f,
+        (matchBandDb[5] + matchBandDb[6] + matchBandDb[7]) / 3.0f * 0.48f);
+    const float airDb = juce::jlimit (-7.0f, 7.0f,
+        (matchBandDb[8] + matchBandDb[9]) * 0.22f);
 
     *bodyShelf.state = *juce::dsp::IIR::Coefficients<float>::makeLowShelf (
         currentSampleRate, 220.0, 0.72, juce::Decibels::decibelsToGain (bodyDb));
@@ -249,18 +352,19 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
     presenceShelf.process (context);
     airShelf.process (context);
 
-    if (strength > 1.0f)
-    {
-        const float drive = 1.0f + (strength - 1.0f) * 1.6f;
-        const float normalise = 1.0f / std::tanh (drive);
+    const float preGainLinear =
+        juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("pregain")->load());
+    const float targetRms = computeRms (dryBuffer) * preGainLinear;
+    const float wetRms = computeRms (buffer);
 
-        for (int ch = 0; ch < numChannels; ++ch)
-        {
-            auto* samples = buffer.getWritePointer (ch);
-            for (int s = 0; s < numSamples; ++s)
-                samples[s] = std::tanh (samples[s] * drive) * normalise;
-        }
-    }
+    float compensation = 1.0f;
+    if (targetRms > 1.0e-5f && wetRms > 1.0e-5f)
+        compensation = juce::jlimit (0.45f, 2.20f, targetRms / wetRms);
+
+    loudnessCompensation.setTargetValue (compensation);
+    const float gainStart = loudnessCompensation.getCurrentValue();
+    const float gainEnd = loudnessCompensation.skip (numSamples);
+    buffer.applyGainRamp (0, numSamples, gainStart, gainEnd);
 
     const float wet = parameters.getRawParameterValue ("mix")->load() * 0.01f;
     const float dry = 1.0f - wet;
@@ -470,7 +574,8 @@ std::optional<VoiceProfile> MorphProcessor::analyseVoiceFile (const juce::File& 
     meanDb /= (float) VoiceProfile::bandCount;
 
     for (int i = 0; i < VoiceProfile::bandCount; ++i)
-        profile.bandDb[(size_t) i] = juce::jlimit (-18.0f, 18.0f, (db[(size_t) i] - meanDb) * 1.42f);
+        profile.bandDb[(size_t) i] =
+            juce::jlimit (-18.0f, 18.0f, (db[(size_t) i] - meanDb) * 0.90f);
 
     if (! pitches.empty())
     {
