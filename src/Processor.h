@@ -57,6 +57,8 @@ public:
     int getActiveWaypoint() const noexcept { return activeWaypoint.load(); }
     juce::Point<float> getWaypoint (int index) const;
     float getWaypointRadius (int index) const;
+    juce::Point<float> getEffectiveMorphPoint() const;
+    float getEffectiveRadius() const;
 
     float getInputMeter() const noexcept { return inputMeter.load(); }
     float getOutputMeter() const noexcept { return outputMeter.load(); }
