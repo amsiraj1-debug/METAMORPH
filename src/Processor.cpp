@@ -303,7 +303,8 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
 
     buffer.applyGain (juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("pregain")->load()));
 
-    bool dnniProcessed = false;
+    bool dnniStageProcessed = false;
+    bool dnniFullGraphProcessed = false;
 
     if (dnniBackend.isReady())
     {
@@ -313,9 +314,10 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
         for (int ch = 0; ch < numChannels; ++ch)
             modelWorkBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
 
-        dnniProcessed = dnniBackend.process (modelWorkBuffer);
+        dnniStageProcessed = dnniBackend.process (modelWorkBuffer);
+        dnniFullGraphProcessed = dnniStageProcessed && dnniBackend.isFullGraphReady();
 
-        if (dnniProcessed)
+        if (dnniStageProcessed)
         {
             for (int ch = 0; ch < numChannels; ++ch)
                 buffer.copyFrom (ch, 0, modelWorkBuffer, ch, 0, numSamples);
@@ -329,7 +331,10 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
     const float y = midiMorphOverride.load() ? midiMorphY.load() : parameters.getRawParameterValue ("morphY")->load();
     const float radius = midiMorphOverride.load() ? midiRadius.load() : parameters.getRawParameterValue ("radius")->load();
 
-    if (! dnniProcessed)
+    // The native partial DNnI stage is model-assisted preprocessing. Until every
+    // graph operator is decoded, keep the reference-voice matcher underneath it.
+    // A complete runtime may replace that stage entirely.
+    if (! dnniFullGraphProcessed)
     {
         const auto targetProfileDb = computeMorphBandGains (x, y, radius);
         const float strength = parameters.getRawParameterValue ("strength")->load() * 0.01f;
