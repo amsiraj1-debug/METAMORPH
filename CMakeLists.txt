@@ -46,6 +46,8 @@ target_sources(MetamorphRebuild PRIVATE
   src/PitchShifter.h
   src/DnniBackend.cpp
   src/DnniBackend.h
+  src/DnniReader.cpp
+  src/DnniReader.h
 )
 
 target_compile_definitions(MetamorphRebuild PUBLIC
@@ -59,6 +61,7 @@ target_link_libraries(MetamorphRebuild PRIVATE
   juce::juce_audio_formats
   juce::juce_dsp
   juce::juce_gui_extra
+  juce::juce_cryptography
   PUBLIC
   juce::juce_recommended_config_flags
   juce::juce_recommended_lto_flags
@@ -85,6 +88,8 @@ target_sources(MetamorphCoreTests PRIVATE
   src/PitchShifter.h
   src/DnniBackend.cpp
   src/DnniBackend.h
+  src/DnniReader.cpp
+  src/DnniReader.h
 )
 
 target_compile_definitions(MetamorphCoreTests PUBLIC
@@ -98,6 +103,7 @@ target_link_libraries(MetamorphCoreTests PRIVATE
   juce::juce_audio_formats
   juce::juce_dsp
   juce::juce_gui_extra
+  juce::juce_cryptography
   PUBLIC
   juce::juce_recommended_config_flags
   juce::juce_recommended_warning_flags
