@@ -71,8 +71,10 @@ private:
     std::optional<VoiceProfile> analyseVoiceFile (const juce::File& file, juce::String& errorMessage);
     std::array<float, VoiceProfile::bandCount> computeMorphBandGains (float x, float y, float radius) const;
     void updateFilterTargets (const std::array<float, VoiceProfile::bandCount>& targetDb);
+    void updateLiveSourceSpectrum (const juce::AudioBuffer<float>& source);
     void applyParameterValue (const juce::String& id, float plainValue);
     static float computePeak (const juce::AudioBuffer<float>& buffer);
+    static float computeRms (const juce::AudioBuffer<float>& buffer);
 
     juce::AudioFormatManager formatManager;
     mutable juce::CriticalSection profilesLock;
@@ -85,6 +87,17 @@ private:
     std::array<juce::SmoothedValue<float>, VoiceProfile::bandCount> smoothedBandDb;
     DualDelayPitchShifter pitchShifter;
     juce::AudioBuffer<float> dryBuffer;
+
+    static constexpr int liveFftOrder = 11;
+    static constexpr int liveFftSize = 1 << liveFftOrder;
+    juce::dsp::FFT liveFft { liveFftOrder };
+    juce::dsp::WindowingFunction<float> liveWindow { (size_t) liveFftSize, juce::dsp::WindowingFunction<float>::hann, true };
+    std::array<float, liveFftSize> liveAnalysisRing {};
+    std::array<float, liveFftSize * 2> liveFftData {};
+    std::array<float, VoiceProfile::bandCount> liveSourceBandDb {};
+    int liveAnalysisWrite { 0 };
+    int liveAnalysisFill { 0 };
+    juce::SmoothedValue<float> loudnessCompensation;
 
     double currentSampleRate { 44100.0 };
 
