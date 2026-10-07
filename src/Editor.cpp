@@ -294,6 +294,12 @@ MorphEditor::MorphEditor (MorphProcessor& p)
     waypointInfoLabel.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (waypointInfoLabel);
 
+    dnniStatusLabel.setText ("DNNI: no model loaded", juce::dontSendNotification);
+    dnniStatusLabel.setColour (juce::Label::textColourId, juce::Colour (mutedColour));
+    dnniStatusLabel.setFont (juce::Font (juce::FontOptions (10.5f)));
+    dnniStatusLabel.setJustificationType (juce::Justification::topLeft);
+    addAndMakeVisible (dnniStatusLabel);
+
     morphCanvas.onStatus = [this] (const juce::String& s)
     {
         showStatus (s);
@@ -376,7 +382,9 @@ MorphEditor::MorphEditor (MorphProcessor& p)
         &saveWaypointButton,
         &previousWaypointButton,
         &nextWaypointButton,
-        &clearWaypointsButton
+        &clearWaypointsButton,
+        &loadDnniButton,
+        &clearDnniButton
     })
     {
         button->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff252c38));
@@ -402,6 +410,17 @@ MorphEditor::MorphEditor (MorphProcessor& p)
     importButton.onClick = [this]
     {
         chooseReferenceFile();
+    };
+
+    loadDnniButton.onClick = [this]
+    {
+        chooseDnniModel();
+    };
+
+    clearDnniButton.onClick = [this]
+    {
+        processor.clearDnniModel();
+        showStatus ("DNnI model cleared; Reference Match fallback active");
     };
 
     generateButton.onClick = [this]
@@ -557,6 +576,44 @@ void MorphEditor::chooseReferenceFile()
     });
 }
 
+void MorphEditor::chooseDnniModel()
+{
+    modelChooser = std::make_unique<juce::FileChooser> (
+        "Choose a DNnI vocal model",
+        processor.getDnniModelFile(),
+        "*.dnni");
+
+    const auto flags =
+        juce::FileBrowserComponent::openMode
+        | juce::FileBrowserComponent::canSelectFiles;
+
+    const juce::Component::SafePointer<MorphEditor> safe (this);
+
+    modelChooser->launchAsync (flags, [safe] (const juce::FileChooser& fc)
+    {
+        if (! safe)
+            return;
+
+        const auto file = fc.getResult();
+        if (! file.existsAsFile())
+            return;
+
+        juce::String error;
+        const bool accepted = safe->processor.loadDnniModel (file, error);
+
+        if (! accepted)
+        {
+            safe->showStatus (error);
+            return;
+        }
+
+        safe->showStatus (safe->processor.getDnniStatus());
+        safe->dnniStatusLabel.setText (
+            "DNNI: " + safe->processor.getDnniStatus(),
+            juce::dontSendNotification);
+    });
+}
+
 void MorphEditor::showStatus (const juce::String& text)
 {
     statusLabel.setText (text, juce::dontSendNotification);
@@ -613,6 +670,7 @@ void MorphEditor::paint (juce::Graphics& g)
     g.drawText ("VOICE SPACE", rightX, 170, 80, 18, juce::Justification::centred);
     g.drawText ("TONE", rightX + 92, 170, 80, 18, juce::Justification::centred);
     g.drawText ("TARGET VOICES", rightX, 330, 180, 18, juce::Justification::centredLeft);
+    g.drawText ("DNNI CONVERSION MODEL", rightX, 438, 180, 18, juce::Justification::centredLeft);
 
     const float in = juce::jlimit (0.0f, 1.0f, processor.getInputMeter());
     const float out = juce::jlimit (0.0f, 1.0f, processor.getOutputMeter());
@@ -671,6 +729,9 @@ void MorphEditor::resized()
     voiceList.setBounds (rx, 350, 180, 30);
     removeButton.setBounds (rx, 390, 86, 30);
     clearButton.setBounds (rx + 94, 390, 86, 30);
+    loadDnniButton.setBounds (rx, 460, 118, 30);
+    clearDnniButton.setBounds (rx + 124, 460, 56, 30);
+    dnniStatusLabel.setBounds (rx, 496, 180, 96);
 
     const int centreX = 194;
     const int centreW = w - 194 - 214;
@@ -705,6 +766,13 @@ void MorphEditor::timerCallback()
     latencyLabel.setText (
         "mode " + juce::String (latencies[juce::jlimit (0, 3, quality)]) + " ms",
         juce::dontSendNotification);
+
+    const auto dnniStatus = processor.getDnniStatus();
+    if (dnniStatus != lastDnniStatus)
+    {
+        lastDnniStatus = dnniStatus;
+        dnniStatusLabel.setText ("DNNI: " + dnniStatus, juce::dontSendNotification);
+    }
 
     const int waypointCount = processor.getWaypointCount();
     const int activeWaypoint = processor.getActiveWaypoint();
