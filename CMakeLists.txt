@@ -104,3 +104,54 @@ target_link_libraries(MetamorphCoreTests PRIVATE
 )
 
 add_test(NAME MetamorphCoreSmoke COMMAND MetamorphCoreTests)
+
+
+juce_add_console_app(DnniInspector
+  PRODUCT_NAME "Metamorph DNnI Inspector"
+)
+
+juce_generate_juce_header(DnniInspector)
+
+target_sources(DnniInspector PRIVATE
+  tools/DnniInspectorMain.cpp
+  src/DnniReader.cpp
+  src/DnniReader.h
+)
+
+target_compile_definitions(DnniInspector PUBLIC
+  JUCE_WEB_BROWSER=0
+  JUCE_USE_CURL=0
+)
+
+target_link_libraries(DnniInspector PRIVATE
+  juce::juce_core
+  PUBLIC
+  juce::juce_recommended_config_flags
+  juce::juce_recommended_warning_flags
+)
+
+juce_add_console_app(DnniReaderTests
+  PRODUCT_NAME "DNnI Reader Tests"
+)
+
+juce_generate_juce_header(DnniReaderTests)
+
+target_sources(DnniReaderTests PRIVATE
+  tests/DnniReaderSmoke.cpp
+  src/DnniReader.cpp
+  src/DnniReader.h
+)
+
+target_compile_definitions(DnniReaderTests PUBLIC
+  JUCE_WEB_BROWSER=0
+  JUCE_USE_CURL=0
+)
+
+target_link_libraries(DnniReaderTests PRIVATE
+  juce::juce_core
+  PUBLIC
+  juce::juce_recommended_config_flags
+  juce::juce_recommended_warning_flags
+)
+
+add_test(NAME DnniReaderSmoke COMMAND DnniReaderTests)
