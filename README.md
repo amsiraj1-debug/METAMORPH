@@ -51,3 +51,12 @@ GitHub Actions uploads the Windows VST3 bundle and standalone EXE as **Metamorph
 Transform Strength has been replaced conceptually by **Voice Match**. The 0-200% control no longer drives a saturation stage or intentionally raises output level. The processor now analyzes the live input spectrum, compares it with the active reference-voice spectrum, and applies the spectral difference. A smoothed RMS compensation stage keeps the wet path close to the dry/input loudness before Dry/Wet mixing.
 
 The Windows regression build verifies that 200% Voice Match remains audibly different from the source, stays within the configured RMS tolerance, remains below the clipping ceiling in the smoke test, and preserves waypoint/MIDI recall behavior.
+
+
+## DNnI model integration
+
+The repository now supports selecting a `.dnni` model from the plugin UI with **LOAD DNNI MODEL**. The uploaded `model.dnni` used to validate this path is 87,529,366 bytes with SHA-256 `48fe10df60bb4d92d2a5f19f02b4d712dc070bebba9d5ea1ef2172d9f82a428c`.
+
+The plugin validates the DNnI container, stores the model selection in plugin state, and routes the wet vocal through a dedicated DNnI backend whenever a compatible authorized runtime bridge is available. If no runtime bridge is installed, the UI states that clearly and the existing Reference Match processor remains active.
+
+See `docs/DNNI_BACKEND.md` for the adapter ABI and runtime setup. The proprietary `.dnni` model itself is intentionally excluded from Git.
