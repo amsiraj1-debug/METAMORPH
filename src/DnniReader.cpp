@@ -14,13 +14,17 @@ bool isPrintableByte (uint8_t value)
     return (value >= 32 && value <= 126) || value == '\n' || value == '\r' || value == '\t';
 }
 
-float readFloat32LittleEndian (const uint8_t* p)
+uint32_t readUInt32LittleEndian (const uint8_t* p)
 {
-    uint32_t bits =
-        (uint32_t) p[0]
+    return (uint32_t) p[0]
         | ((uint32_t) p[1] << 8)
         | ((uint32_t) p[2] << 16)
         | ((uint32_t) p[3] << 24);
+}
+
+float readFloat32LittleEndian (const uint8_t* p)
+{
+    const uint32_t bits = readUInt32LittleEndian (p);
 
     float value = 0.0f;
     std::memcpy (&value, &bits, sizeof (value));
@@ -370,6 +374,365 @@ bool DnniReader::inspect (const juce::File& file,
 
         offset += bytesRead;
     }
+
+    return true;
+}
+
+
+bool DnniReader::parseNativeModel (const juce::File& file,
+                                   DnniNativeModelInfo& model,
+                                   juce::String& errorMessage) const
+{
+    model = {};
+    model.file = file;
+    model.fileSize = file.getSize();
+
+    if (! file.existsAsFile())
+    {
+        errorMessage = "DNnI file does not exist.";
+        return false;
+    }
+
+    auto stream = file.createInputStream();
+    if (stream == nullptr || ! stream->openedOk())
+    {
+        errorMessage = "Could not open DNnI file.";
+        return false;
+    }
+
+    uint8_t signature[8] {};
+    if (stream->read (signature, 8) != 8)
+    {
+        errorMessage = "Could not read DNnI file header.";
+        return false;
+    }
+
+    if (! std::equal (expectedSignature.begin(), expectedSignature.end(), signature))
+    {
+        errorMessage = "Unknown DNnI signature.";
+        return false;
+    }
+
+    juce::int64 position = 8;
+    int recordIndex = 0;
+
+    while (position < model.fileSize)
+    {
+        if (model.fileSize - position < 20)
+        {
+            errorMessage = "DNnI record header is truncated at offset " + juce::String (position) + ".";
+            return false;
+        }
+
+        if (! stream->setPosition (position))
+        {
+            errorMessage = "Could not seek DNnI record at offset " + juce::String (position) + ".";
+            return false;
+        }
+
+        uint8_t header[20] {};
+        if (stream->read (header, 20) != 20)
+        {
+            errorMessage = "Could not read DNnI record header.";
+            return false;
+        }
+
+        const bool marker40 =
+            header[0] == 0xff && header[1] == 0x40 && header[2] == 0xca && header[3] == 0x7f;
+        const bool marker41 =
+            header[0] == 0xff && header[1] == 0x41 && header[2] == 0xca && header[3] == 0x7f;
+
+        if (! marker40 && ! marker41)
+        {
+            errorMessage =
+                "Unsupported DNnI record marker at offset " + juce::String (position) + ".";
+            return false;
+        }
+
+        DnniRecordInfo record;
+        std::copy (header, header + 4, record.marker.begin());
+        std::copy (header + 4, header + 16, record.identifier.begin());
+        record.recordOffset = position;
+        record.payloadOffset = position + 20;
+        record.payloadSize = readUInt32LittleEndian (header + 16);
+
+        const juce::int64 payloadEnd =
+            record.payloadOffset + (juce::int64) record.payloadSize;
+
+        if (payloadEnd < record.payloadOffset || payloadEnd > model.fileSize)
+        {
+            errorMessage =
+                "DNnI record payload extends beyond EOF at record " + juce::String (recordIndex) + ".";
+            return false;
+        }
+
+        model.records.push_back (record);
+        ++model.recordCount;
+        if (marker40) ++model.marker40Count;
+        if (marker41) ++model.marker41Count;
+
+        const int prefixSize = (int) juce::jmin ((uint32_t) 20, record.payloadSize);
+        uint8_t prefix[20] {};
+
+        if (prefixSize > 0)
+        {
+            if (! stream->setPosition (record.payloadOffset)
+                || stream->read (prefix, prefixSize) != prefixSize)
+            {
+                errorMessage =
+                    "Could not read DNnI record payload prefix at record " + juce::String (recordIndex) + ".";
+                return false;
+            }
+        }
+
+        if (marker40 && record.payloadSize >= 4)
+        {
+            const uint32_t first = readUInt32LittleEndian (prefix);
+
+            if ((juce::int64) record.payloadSize == 4 + (juce::int64) first * 4
+                && first > 0 && first < 10000000u)
+            {
+                DnniFloatVectorInfo vector;
+                vector.recordIndex = recordIndex;
+                vector.count = first;
+                vector.dataOffset = record.payloadOffset + 4;
+                model.floatVectors.push_back (vector);
+            }
+
+            if (record.payloadSize >= 24 && prefixSize >= 16)
+            {
+                const uint32_t headerBytes = first;
+                const uint32_t code = readUInt32LittleEndian (prefix + 4);
+                const uint32_t reserved = readUInt32LittleEndian (prefix + 8);
+                const uint32_t rows = readUInt32LittleEndian (prefix + 12);
+
+                if (headerBytes == 16 && reserved == 0 && rows > 0 && rows < 65536u)
+                {
+                    const juce::int64 fixedBytes = 16 + (juce::int64) rows * 4 + 8;
+                    const juce::int64 weightBytes = (juce::int64) record.payloadSize - fixedBytes;
+
+                    if (weightBytes > 0 && weightBytes % rows == 0)
+                    {
+                        const juce::int64 cols64 = weightBytes / rows;
+
+                        if (cols64 > 0 && cols64 < 65536)
+                        {
+                            DnniQuantMatrixInfo matrix;
+                            matrix.recordIndex = recordIndex;
+                            matrix.code = code;
+                            matrix.rows = rows;
+                            matrix.cols = (uint32_t) cols64;
+                            matrix.scalesOffset = record.payloadOffset + 16;
+                            matrix.weightsOffset = matrix.scalesOffset + (juce::int64) rows * 4;
+                            model.quantMatrices.push_back (matrix);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (marker41 && record.payloadSize == 20 && prefixSize == 20)
+        {
+            DnniConv1DInfo op;
+            op.recordIndex = recordIndex;
+            op.kernelSize = readUInt32LittleEndian (prefix);
+            op.stride = readUInt32LittleEndian (prefix + 4);
+            op.padding = readUInt32LittleEndian (prefix + 8);
+            op.dilation = readUInt32LittleEndian (prefix + 12);
+            op.groups = readUInt32LittleEndian (prefix + 16);
+
+            if (op.kernelSize > 0 && op.kernelSize <= 31
+                && op.stride > 0 && op.stride <= 16
+                && op.dilation > 0 && op.dilation <= 64
+                && op.groups > 0 && op.groups <= 65536)
+            {
+                model.conv1dOps.push_back (op);
+            }
+        }
+
+        position = payloadEnd;
+        ++recordIndex;
+    }
+
+    model.consumedExactly = position == model.fileSize;
+
+    if (! model.consumedExactly || model.records.empty())
+    {
+        errorMessage = "DNnI record stream did not consume the file exactly.";
+        return false;
+    }
+
+    return true;
+}
+
+bool DnniReader::readQuantMatrixScales (const DnniNativeModelInfo& model,
+                                        int matrixIndex,
+                                        std::vector<float>& scales,
+                                        juce::String& errorMessage) const
+{
+    scales.clear();
+
+    if (! juce::isPositiveAndBelow (matrixIndex, (int) model.quantMatrices.size()))
+    {
+        errorMessage = "DNnI matrix index is out of range.";
+        return false;
+    }
+
+    const auto& matrix = model.quantMatrices[(size_t) matrixIndex];
+    auto stream = model.file.createInputStream();
+
+    if (stream == nullptr || ! stream->openedOk() || ! stream->setPosition (matrix.scalesOffset))
+    {
+        errorMessage = "Could not seek DNnI matrix scales.";
+        return false;
+    }
+
+    std::vector<uint8_t> bytes ((size_t) matrix.rows * 4);
+    if (stream->read (bytes.data(), (int) bytes.size()) != (int) bytes.size())
+    {
+        errorMessage = "Could not read DNnI matrix scales.";
+        return false;
+    }
+
+    scales.resize (matrix.rows);
+    for (uint32_t row = 0; row < matrix.rows; ++row)
+    {
+        const float value = readFloat32LittleEndian (bytes.data() + (size_t) row * 4);
+
+        if (! std::isfinite (value) || value < 0.0f)
+        {
+            errorMessage = "DNnI matrix contains an invalid row scale.";
+            scales.clear();
+            return false;
+        }
+
+        scales[(size_t) row] = value;
+    }
+
+    return true;
+}
+
+bool DnniReader::readQuantMatrixRow (const DnniNativeModelInfo& model,
+                                     int matrixIndex,
+                                     int row,
+                                     std::vector<float>& output,
+                                     juce::String& errorMessage) const
+{
+    output.clear();
+
+    if (! juce::isPositiveAndBelow (matrixIndex, (int) model.quantMatrices.size()))
+    {
+        errorMessage = "DNnI matrix index is out of range.";
+        return false;
+    }
+
+    const auto& matrix = model.quantMatrices[(size_t) matrixIndex];
+
+    if (! juce::isPositiveAndBelow (row, (int) matrix.rows))
+    {
+        errorMessage = "DNnI matrix row is out of range.";
+        return false;
+    }
+
+    std::vector<float> scales;
+    if (! readQuantMatrixScales (model, matrixIndex, scales, errorMessage))
+        return false;
+
+    auto stream = model.file.createInputStream();
+    const juce::int64 rowOffset =
+        matrix.weightsOffset + (juce::int64) row * matrix.cols;
+
+    if (stream == nullptr || ! stream->openedOk() || ! stream->setPosition (rowOffset))
+    {
+        errorMessage = "Could not seek DNnI matrix row.";
+        return false;
+    }
+
+    std::vector<uint8_t> quantized (matrix.cols);
+    if (stream->read (quantized.data(), (int) quantized.size()) != (int) quantized.size())
+    {
+        errorMessage = "Could not read DNnI matrix row.";
+        return false;
+    }
+
+    output.resize (matrix.cols);
+    const float scale = scales[(size_t) row] / 127.0f;
+
+    for (uint32_t column = 0; column < matrix.cols; ++column)
+        output[(size_t) column] = (float) (int8_t) quantized[(size_t) column] * scale;
+
+    return true;
+}
+
+bool DnniReader::deriveModelSpectralSignature (const DnniNativeModelInfo& model,
+                                               std::array<float, 10>& signatureDb,
+                                               juce::String& errorMessage) const
+{
+    signatureDb.fill (0.0f);
+
+    if (model.quantMatrices.empty())
+    {
+        errorMessage = "DNnI model contains no decoded quantized matrices.";
+        return false;
+    }
+
+    int selected = -1;
+
+    for (int i = 0; i < (int) model.quantMatrices.size(); ++i)
+    {
+        const auto& matrix = model.quantMatrices[(size_t) i];
+
+        if (matrix.rows == 72 && matrix.cols == 512)
+        {
+            selected = i;
+            break;
+        }
+    }
+
+    if (selected < 0)
+        selected = 0;
+
+    std::vector<float> scales;
+    if (! readQuantMatrixScales (model, selected, scales, errorMessage))
+        return false;
+
+    if (scales.empty())
+    {
+        errorMessage = "DNnI matrix has no row scales.";
+        return false;
+    }
+
+    std::array<float, 10> accum {};
+    std::array<int, 10> counts {};
+
+    for (int row = 0; row < (int) scales.size(); ++row)
+    {
+        const int band =
+            juce::jlimit (0, 9, (row * 10) / juce::jmax (1, (int) scales.size()));
+
+        const float db =
+            20.0f * std::log10 (juce::jmax (1.0e-9f, scales[(size_t) row]));
+
+        accum[(size_t) band] += db;
+        ++counts[(size_t) band];
+    }
+
+    float mean = 0.0f;
+
+    for (int band = 0; band < 10; ++band)
+    {
+        signatureDb[(size_t) band] =
+            counts[(size_t) band] > 0
+                ? accum[(size_t) band] / (float) counts[(size_t) band]
+                : 0.0f;
+
+        mean += signatureDb[(size_t) band];
+    }
+
+    mean *= 0.1f;
+
+    for (auto& value : signatureDb)
+        value = juce::jlimit (-6.0f, 6.0f, (value - mean) * 0.55f);
 
     return true;
 }
