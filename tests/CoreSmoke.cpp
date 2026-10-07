@@ -31,10 +31,15 @@ int main()
     processor.setMorphPointFromUI (profiles.front().position.x, profiles.front().position.y);
     processor.setInfluenceFromUI (0.28f);
 
+    if (auto* strength = processor.parameters.getParameter ("strength"))
+        strength->setValueNotifyingHost (strength->convertTo0to1 (200.0f));
+
     juce::MidiBuffer midi;
     double differenceEnergy = 0.0;
     double sourceEnergy = 0.0;
+    double outputEnergy = 0.0;
     double phase = 0.0;
+    float maxOutput = 0.0f;
 
     for (int blockIndex = 0; blockIndex < 96; ++blockIndex)
     {
@@ -66,6 +71,14 @@ int main()
                 const double d = a - b;
                 differenceEnergy += d * d;
                 sourceEnergy += b * b;
+                outputEnergy += a * a;
+                maxOutput = juce::jmax (maxOutput, (float) std::abs (a));
+
+                if (! std::isfinite (a))
+                {
+                    std::cerr << "FAIL: non-finite sample at 200% reference match\n";
+                    return 5;
+                }
             }
         }
     }
@@ -78,6 +91,25 @@ int main()
         std::cerr << "FAIL: morph DSP is too close to dry input, relative difference="
                   << relativeDifference << "\n";
         return 2;
+    }
+
+    const double rmsRatio =
+        std::sqrt (outputEnergy / std::max (1.0e-12, sourceEnergy));
+    const double loudnessDeltaDb =
+        20.0 * std::log10 (std::max (1.0e-9, rmsRatio));
+
+    if (std::abs (loudnessDeltaDb) > 1.25)
+    {
+        std::cerr << "FAIL: 200% reference match changed RMS by "
+                  << loudnessDeltaDb << " dB instead of preserving level\n";
+        return 6;
+    }
+
+    if (maxOutput > 0.98f)
+    {
+        std::cerr << "FAIL: 200% reference match approached clipping, peak="
+                  << maxOutput << "\n";
+        return 7;
     }
 
     processor.setMorphPointFromUI (0.23f, 0.71f);
@@ -117,6 +149,7 @@ int main()
     }
 
     std::cout << "PASS: audible morph relative difference=" << relativeDifference
-              << ", waypoint and MIDI recall OK\n";
+              << ", 200% loudness delta=" << loudnessDeltaDb
+              << " dB, waypoint and MIDI recall OK\n";
     return 0;
 }
