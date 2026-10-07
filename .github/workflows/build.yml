@@ -1,0 +1,42 @@
+name: Build Windows VST3
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Compile VST3 and integration tests
+        run: cmake --build build --config Release --parallel 2
+      - name: Test recording, audio files, parameters and UI
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Capture the plugin interface
+        run: ./build/MetamorphTests_artefacts/Release/MetamorphTests.exe "$pwd/build/interface.png"
+      - name: Bundle Python, inference engine and support models
+        run: python tools/package_windows.py --build build
+      - name: Test the packaged voice engine
+        run: '& "dist/Metamorph-Rebuild-Windows-x64/Metamorph Rebuild.vst3/Contents/Resources/runtime/python.exe" -B tests/worker_smoke.py "dist/Metamorph-Rebuild-Windows-x64/Metamorph Rebuild.vst3/Contents/Resources"'
+      - name: Upload installable VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: Metamorph-Rebuild-Windows-x64-VST3
+          path: dist/Metamorph-Rebuild-Windows-x64/
+          compression-level: 6
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload interface preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: Plugin-interface
+          path: build/interface.png

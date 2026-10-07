@@ -1,0 +1,13 @@
+/build/
+/dist/
+/dependencies/
+/resources/
+__pycache__/
+*.pyc
+*.pth
+*.onnx
+*.index
+*.wav
+*.bf
+*.zip
+*.log
