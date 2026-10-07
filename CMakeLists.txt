@@ -62,3 +62,41 @@ target_link_libraries(MetamorphRebuild PRIVATE
   juce::juce_recommended_lto_flags
   juce::juce_recommended_warning_flags
 )
+
+
+enable_testing()
+
+juce_add_console_app(MetamorphCoreTests
+  PRODUCT_NAME "Metamorph Core Tests"
+)
+
+juce_generate_juce_header(MetamorphCoreTests)
+
+target_sources(MetamorphCoreTests PRIVATE
+  tests/CoreSmoke.cpp
+  src/Processor.cpp
+  src/Processor.h
+  src/Editor.cpp
+  src/Editor.h
+  src/VoiceProfile.cpp
+  src/VoiceProfile.h
+  src/PitchShifter.h
+)
+
+target_compile_definitions(MetamorphCoreTests PUBLIC
+  JUCE_WEB_BROWSER=0
+  JUCE_USE_CURL=0
+  JUCE_VST3_CAN_REPLACE_VST2=0
+)
+
+target_link_libraries(MetamorphCoreTests PRIVATE
+  juce::juce_audio_utils
+  juce::juce_audio_formats
+  juce::juce_dsp
+  juce::juce_gui_extra
+  PUBLIC
+  juce::juce_recommended_config_flags
+  juce::juce_recommended_warning_flags
+)
+
+add_test(NAME MetamorphCoreSmoke COMMAND MetamorphCoreTests)
