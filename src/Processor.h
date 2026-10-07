@@ -2,6 +2,7 @@
 #include <JuceHeader.h>
 #include "VoiceProfile.h"
 #include "PitchShifter.h"
+#include "DnniBackend.h"
 #include <array>
 #include <atomic>
 #include <optional>
@@ -45,6 +46,12 @@ public:
     void clearVoices();
     std::vector<VoiceProfile> getProfilesSnapshot() const;
 
+    bool loadDnniModel (const juce::File& file, juce::String& errorMessage);
+    void clearDnniModel();
+    juce::String getDnniStatus() const { return dnniBackend.getStatus(); }
+    juce::File getDnniModelFile() const { return dnniBackend.getModelFile(); }
+    bool isDnniReady() const noexcept { return dnniBackend.isReady(); }
+
     void setMorphPointFromUI (float x, float y);
     void setInfluenceFromUI (float radius);
 
@@ -86,7 +93,9 @@ private:
     BandFilter airShelf;
     std::array<juce::SmoothedValue<float>, VoiceProfile::bandCount> smoothedBandDb;
     DualDelayPitchShifter pitchShifter;
+    DnniModelBackend dnniBackend;
     juce::AudioBuffer<float> dryBuffer;
+    juce::AudioBuffer<float> modelWorkBuffer;
 
     static constexpr int liveFftOrder = 11;
     static constexpr int liveFftSize = 1 << liveFftOrder;
