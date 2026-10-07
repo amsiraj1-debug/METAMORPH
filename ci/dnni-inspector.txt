@@ -1,0 +1,1 @@
+Verify clean-room DNnI inspector build and tests.
