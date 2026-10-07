@@ -1,75 +1,99 @@
 #pragma once
 #include <JuceHeader.h>
-#include <atomic>
+#include "VoiceProfile.h"
+#include "PitchShifter.h"
 #include <array>
+#include <atomic>
+#include <optional>
+#include <vector>
 
-class MorphProcessor final : public juce::AudioProcessor, private juce::Thread
+class MorphProcessor final : public juce::AudioProcessor
 {
 public:
+    using APVTS = juce::AudioProcessorValueTreeState;
+
     MorphProcessor();
-    ~MorphProcessor() override;
-    void prepareToPlay(double, int) override;
+    ~MorphProcessor() override = default;
+
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
-    void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
-    bool isBusesLayoutSupported(const BusesLayout&) const override;
+    bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
-    const juce::String getName() const override { return "Metamorph Rebuild"; }
-    bool acceptsMidi() const override { return false; }
+    const juce::String getName() const override { return "Metamorph CR"; }
+    bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
-    double getTailLengthSeconds() const override { return 0; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 0.0; }
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
-    void setCurrentProgram(int) override {}
-    const juce::String getProgramName(int) override { return {}; }
-    void changeProgramName(int, const juce::String&) override {}
-    void getStateInformation(juce::MemoryBlock&) override;
-    void setStateInformation(const void*, int) override;
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+    void getStateInformation (juce::MemoryBlock& destData) override;
+    void setStateInformation (const void* data, int sizeInBytes) override;
     juce::AudioProcessorParameter* getBypassParameter() const override;
 
-    bool setModel(const juce::File&);
-    juce::String modelName() const;
-    bool armRecord();
-    void stopRecord();
-    bool importAudio(const juce::File&);
-    bool transform();
-    void cancelTransform();
-    void resetAudio();
-    void togglePreview();
-    bool exportAudio(const juce::File&);
-    void setResources(const juce::File&);
-    juce::String status() const;
-    std::array<float,256> waveform() const;
-    bool hasAudio() const { return recordedSamples.load() > 0; }
-    double duration() const { return recordedSamples.load() / sampleRate.load(); }
-    bool isBusy() const { return busy.load(); }
-    bool isArmed() const { return armed.load(); }
-    bool hasResult() const { return resultReady.load(); }
-    bool isPreviewing() const { return preview.load(); }
-    float level() const { return meter.load(); }
-    float completion() const { return progress.load(); }
-    juce::AudioProcessorValueTreeState parameters;
+    APVTS parameters;
+
+    bool addVoiceFromFile (const juce::File& file, juce::String& errorMessage);
+    void addGeneratedVoice (juce::String hexCode, float voiceSpace, float tone, juce::String customName = {});
+    void addSyntheticPreset (int presetIndex);
+    void removeVoice (int index);
+    void clearVoices();
+    std::vector<VoiceProfile> getProfilesSnapshot() const;
+
+    void setMorphPointFromUI (float x, float y);
+    void setInfluenceFromUI (float radius);
+
+    void addWaypointFromCurrent();
+    void clearWaypoints();
+    void activateWaypoint (int index);
+    void activateNextWaypoint();
+    void activatePreviousWaypoint();
+    int getWaypointCount() const noexcept { return waypointCount.load(); }
+    int getActiveWaypoint() const noexcept { return activeWaypoint.load(); }
+    juce::Point<float> getWaypoint (int index) const;
+
+    float getInputMeter() const noexcept { return inputMeter.load(); }
+    float getOutputMeter() const noexcept { return outputMeter.load(); }
+
+    static APVTS::ParameterLayout layout();
 
 private:
-    void run() override;
-    void message(juce::String);
-    juce::File resourceRoot() const;
-    bool writeWave(const juce::File&, const juce::AudioBuffer<float>&, int, double) const;
-    bool readWave(const juce::File&, juce::AudioBuffer<float>&, double, int maximum) const;
-    static juce::AudioProcessorValueTreeState::ParameterLayout layout();
-    mutable juce::CriticalSection textLock;
-    mutable juce::SpinLock audioLock;
-    juce::String statusText { "Choose a voice model, then record or import audio." };
-    juce::File modelFile, resourcesOverride, sessionFolder;
-    juce::AudioBuffer<float> captured, transformed;
-    std::atomic<double> sampleRate { 48000.0 };
-    std::atomic<int> recordedSamples { 0 };
-    std::atomic<bool> armed { false }, busy { false }, resultReady { false }, preview { false };
-    std::atomic<float> meter { 0 }, progress { 0 };
-    std::atomic<juce::int64> lastHostSample { 0 };
-    juce::int64 originSample = 0, fallbackSample = 0;
-    int previewSample = 0;
-    bool awaitingOrigin = false, wasRecording = false;
-    float jobPitch = 0;
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MorphProcessor)
+    using BandFilter = juce::dsp::ProcessorDuplicator<juce::dsp::IIR::Filter<float>, juce::dsp::IIR::Coefficients<float>>;
+
+    std::optional<VoiceProfile> analyseVoiceFile (const juce::File& file, juce::String& errorMessage);
+    std::array<float, VoiceProfile::bandCount> computeMorphBandGains (float x, float y, float radius) const;
+    void updateFilterTargets (const std::array<float, VoiceProfile::bandCount>& targetDb);
+    void applyParameterValue (const juce::String& id, float plainValue);
+    static float computePeak (const juce::AudioBuffer<float>& buffer);
+
+    juce::AudioFormatManager formatManager;
+    mutable juce::CriticalSection profilesLock;
+    std::vector<VoiceProfile> profiles;
+
+    std::array<BandFilter, VoiceProfile::bandCount> bandFilters;
+    std::array<juce::SmoothedValue<float>, VoiceProfile::bandCount> smoothedBandDb;
+    DualDelayPitchShifter pitchShifter;
+    juce::AudioBuffer<float> dryBuffer;
+
+    double currentSampleRate { 44100.0 };
+
+    std::array<std::atomic<float>, 8> waypointX {};
+    std::array<std::atomic<float>, 8> waypointY {};
+    std::atomic<int> waypointCount { 0 };
+    std::atomic<int> activeWaypoint { -1 };
+
+    std::atomic<bool> midiMorphOverride { false };
+    std::atomic<float> midiMorphX { 0.5f };
+    std::atomic<float> midiMorphY { 0.5f };
+    std::atomic<float> midiRadius { 0.34f };
+
+    std::atomic<float> inputMeter { 0.0f };
+    std::atomic<float> outputMeter { 0.0f };
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MorphProcessor)
 };
