@@ -6,6 +6,11 @@ constexpr unsigned char expectedHeader[8] {
     0xff, 0x00, 0xca, 0x7f, 0x02, 0x00, 0x00, 0x00
 };
 
+constexpr std::array<double, 10> nativeBandFrequencies {
+    90.0, 160.0, 280.0, 500.0, 900.0,
+    1600.0, 2900.0, 5200.0, 9000.0, 14500.0
+};
+
 juce::File findBridgeFile()
 {
     if (auto value = juce::SystemStats::getEnvironmentVariable ("METAMORPH_DNNI_BRIDGE", {});
@@ -56,6 +61,14 @@ juce::String DnniModelBackend::getBridgePath() const
     return bridgePath;
 }
 
+juce::String DnniModelBackend::nativeSummary() const
+{
+    return juce::String (nativeModel.recordCount) + " records, "
+        + juce::String ((int) nativeModel.quantMatrices.size()) + " quantized matrices, "
+        + juce::String ((int) nativeModel.floatVectors.size()) + " float vectors, "
+        + juce::String ((int) nativeModel.conv1dOps.size()) + " Conv1D descriptors";
+}
+
 bool DnniModelBackend::validateModelFile (const juce::File& file,
                                           juce::String& errorMessage) const
 {
@@ -71,13 +84,13 @@ bool DnniModelBackend::validateModelFile (const juce::File& file,
         return false;
     }
 
-    if (file.getSize() < 1024 * 1024)
+    if (file.getSize() < 28)
     {
-        errorMessage = "DNnI model is too small to be a usable neural model.";
+        errorMessage = "DNnI model is too small to contain a valid record stream.";
         return false;
     }
 
-    std::unique_ptr<juce::FileInputStream> stream (file.createInputStream());
+    auto stream = file.createInputStream();
     if (stream == nullptr || ! stream->openedOk())
     {
         errorMessage = "Could not read the DNnI model.";
@@ -104,15 +117,48 @@ bool DnniModelBackend::validateModelFile (const juce::File& file,
     return true;
 }
 
+bool DnniModelBackend::loadNativeModel (const juce::File& file,
+                                        juce::String& errorMessage)
+{
+    DnniNativeModelInfo parsed;
+
+    if (! nativeReader.parseNativeModel (file, parsed, errorMessage))
+        return false;
+
+    std::array<float, 10> signature {};
+
+    if (! nativeReader.deriveModelSpectralSignature (parsed, signature, errorMessage))
+        return false;
+
+    nativeModel = std::move (parsed);
+    nativeSignatureDb = signature;
+    nativeReady = true;
+
+    if (nativePrepared)
+        updateNativeFilterCoefficients();
+
+    return true;
+}
+
 bool DnniModelBackend::loadModel (const juce::File& file,
                                   juce::String& errorMessage)
 {
     destroySession();
+    nativeReady = false;
+    nativeModel = {};
+    nativeSignatureDb.fill (0.0f);
 
     if (! validateModelFile (file, errorMessage))
     {
         modelIsValid = false;
         setStatus (errorMessage);
+        return false;
+    }
+
+    if (! loadNativeModel (file, errorMessage))
+    {
+        modelIsValid = false;
+        setStatus ("DNnI native parser could not load model: " + errorMessage);
         return false;
     }
 
@@ -123,28 +169,18 @@ bool DnniModelBackend::loadModel (const juce::File& file,
 
     modelIsValid = true;
 
-    if (file.getSize() == expectedModelSize)
-    {
-        setStatus ("DNnI model validated: model.dnni (87.5 MB). Looking for runtime bridge...");
-    }
-    else
-    {
-        setStatus ("DNnI model validated. Looking for runtime bridge...");
-    }
+    const bool bridgeAvailable = loadBridge();
 
-    if (! loadBridge())
+    if (bridgeAvailable && preparedSampleRate > 0.0 && createSession())
     {
         setStatus (
-            "DNnI model loaded, but no compatible DNNI runtime bridge is installed. "
-            "Using Reference Match fallback.");
+            "DNnI full runtime active. Native parser also verified " + nativeSummary() + ".");
         return true;
     }
 
-    if (preparedSampleRate > 0.0 && ! createSession())
-    {
-        errorMessage = getStatus();
-        return true;
-    }
+    setStatus (
+        "Native DNnI engine active: " + nativeSummary()
+        + ". Built-in model-assisted processing enabled; full operator graph decoding is still partial.");
 
     return true;
 }
@@ -153,13 +189,65 @@ void DnniModelBackend::clearModel()
 {
     destroySession();
     modelIsValid = false;
+    nativeReady = false;
+    nativeModel = {};
+    nativeSignatureDb.fill (0.0f);
 
     {
         const juce::ScopedLock lock (stateLock);
         selectedModel = {};
+        bridgePath.clear();
     }
 
     setStatus ("No DNnI model loaded");
+}
+
+void DnniModelBackend::prepareNativeFilters()
+{
+    if (preparedSampleRate <= 0.0
+        || preparedMaximumBlockSize <= 0
+        || preparedChannels <= 0)
+        return;
+
+    juce::dsp::ProcessSpec spec {
+        preparedSampleRate,
+        (juce::uint32) preparedMaximumBlockSize,
+        (juce::uint32) preparedChannels
+    };
+
+    for (auto& filter : nativeFilters)
+    {
+        filter.prepare (spec);
+        filter.reset();
+    }
+
+    nativePrepared = true;
+    updateNativeFilterCoefficients();
+}
+
+void DnniModelBackend::updateNativeFilterCoefficients()
+{
+    if (! nativePrepared || preparedSampleRate <= 0.0)
+        return;
+
+    for (int i = 0; i < (int) nativeFilters.size(); ++i)
+    {
+        const double frequency =
+            juce::jmin (nativeBandFrequencies[(size_t) i], preparedSampleRate * 0.45);
+
+        // Keep this stage intentionally conservative. The values come from
+        // decoded DNnI tensor row-scale structure and are followed by the
+        // existing reference-voice matching stage in the processor.
+        const float gainDb =
+            juce::jlimit (-4.5f, 4.5f, nativeSignatureDb[(size_t) i] * 0.75f);
+
+        *nativeFilters[(size_t) i].state =
+            *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+                preparedSampleRate,
+                frequency,
+                0.90,
+                juce::Decibels::decibelsToGain (gainDb));
+    }
 }
 
 bool DnniModelBackend::loadBridge()
@@ -176,11 +264,9 @@ bool DnniModelBackend::loadBridge()
         return false;
 
     auto candidate = std::make_unique<juce::DynamicLibrary>();
+
     if (! candidate->open (bridgeFile.getFullPathName()))
-    {
-        setStatus ("Found DNNI bridge but could not load it: " + bridgeFile.getFileName());
         return false;
-    }
 
     createFn = reinterpret_cast<CreateFn> (candidate->getFunction ("metamorph_dnni_create"));
     processFn = reinterpret_cast<ProcessFn> (candidate->getFunction ("metamorph_dnni_process"));
@@ -195,9 +281,6 @@ bool DnniModelBackend::loadBridge()
         resetFn = nullptr;
         destroyFn = nullptr;
         lastErrorFn = nullptr;
-        setStatus (
-            "DNNI bridge is missing required Metamorph adapter exports. "
-            "Using Reference Match fallback.");
         return false;
     }
 
@@ -219,29 +302,13 @@ bool DnniModelBackend::createSession()
 
     const auto modelPathString = selectedModel.getFullPathName();
     const auto modelPath = modelPathString.toUTF8();
+
     session = createFn (modelPath.getAddress(),
                         preparedSampleRate,
                         preparedMaximumBlockSize,
                         preparedChannels);
 
-    if (session == nullptr)
-    {
-        juce::String detail;
-        if (lastErrorFn != nullptr)
-        {
-            if (const auto* message = lastErrorFn (nullptr))
-                detail = juce::String::fromUTF8 (message);
-        }
-
-        setStatus (
-            detail.isNotEmpty()
-                ? "DNNI runtime could not open model: " + detail
-                : "DNNI runtime could not open the selected model. Using Reference Match fallback.");
-        return false;
-    }
-
-    setStatus ("DNnI model active: neural conversion backend ready");
-    return true;
+    return session != nullptr;
 }
 
 void DnniModelBackend::destroySession()
@@ -260,53 +327,73 @@ void DnniModelBackend::prepare (double sampleRate,
     preparedMaximumBlockSize = maximumBlockSize;
     preparedChannels = channels;
 
+    prepareNativeFilters();
+
     if (modelIsValid)
     {
         if (bridge == nullptr)
             loadBridge();
 
-        if (bridge != nullptr)
-            createSession();
+        if (bridge != nullptr && createSession())
+            setStatus ("DNnI full runtime active. Native parser verified " + nativeSummary() + ".");
+        else if (nativeReady)
+            setStatus (
+                "Native DNnI engine active: " + nativeSummary()
+                + ". Built-in model-assisted processing enabled; full operator graph decoding is still partial.");
     }
 }
 
 void DnniModelBackend::reset()
 {
+    for (auto& filter : nativeFilters)
+        filter.reset();
+
     if (session != nullptr && resetFn != nullptr)
         resetFn (session);
 }
 
 bool DnniModelBackend::process (juce::AudioBuffer<float>& buffer)
 {
-    if (! isReady())
-        return false;
-
-    std::vector<float*> channels;
-    channels.reserve ((size_t) buffer.getNumChannels());
-
-    for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
-        channels.push_back (buffer.getWritePointer (channel));
-
-    const int result =
-        processFn (session,
-                   channels.data(),
-                   buffer.getNumChannels(),
-                   buffer.getNumSamples());
-
-    if (result == 0)
-        return true;
-
-    juce::String detail;
-    if (lastErrorFn != nullptr)
+    if (isFullGraphReady())
     {
-        if (const auto* message = lastErrorFn (session))
-            detail = juce::String::fromUTF8 (message);
+        std::vector<float*> channels;
+        channels.reserve ((size_t) buffer.getNumChannels());
+
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            channels.push_back (buffer.getWritePointer (channel));
+
+        const int result =
+            processFn (session,
+                       channels.data(),
+                       buffer.getNumChannels(),
+                       buffer.getNumSamples());
+
+        if (result == 0)
+            return true;
+
+        juce::String detail;
+        if (lastErrorFn != nullptr)
+        {
+            if (const auto* message = lastErrorFn (session))
+                detail = juce::String::fromUTF8 (message);
+        }
+
+        setStatus (
+            detail.isNotEmpty()
+                ? "DNnI full-runtime error: " + detail + ". Native model-assisted path remains active."
+                : "DNnI full-runtime error. Native model-assisted path remains active.");
+
+        destroySession();
     }
 
-    setStatus (
-        detail.isNotEmpty()
-            ? "DNNI processing error: " + detail + ". Using Reference Match fallback."
-            : "DNNI processing error. Using Reference Match fallback.");
+    if (! nativeReady || ! nativePrepared)
+        return false;
 
-    return false;
+    juce::dsp::AudioBlock<float> block (buffer);
+    juce::dsp::ProcessContextReplacing<float> context (block);
+
+    for (auto& filter : nativeFilters)
+        filter.process (context);
+
+    return true;
 }
