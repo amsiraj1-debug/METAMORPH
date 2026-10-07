@@ -34,7 +34,7 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item -Recurse -Force "build/MetamorphRebuild_artefacts/Release/VST3/Metamorph CR.vst3" "dist/Metamorph CR.vst3"
           Copy-Item -Force "build/MetamorphRebuild_artefacts/Release/Standalone/Metamorph CR.exe" "dist/Metamorph CR.exe"
-          Copy-Item -Force "build/DnniInspector_artefacts/Release/Metamorph DNnI Inspector.exe" "dist/DnniInspector.exe"
+          Copy-Item -Force "build/DnniInspector_artefacts/Release/DnniInspector.exe" "dist/DnniInspector.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
