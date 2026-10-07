@@ -1,0 +1,1 @@
+Verify DNnI model loader, runtime adapter, VST3 and regression tests.
