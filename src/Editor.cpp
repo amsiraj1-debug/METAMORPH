@@ -604,7 +604,7 @@ void MorphEditor::paint (juce::Graphics& g)
     g.drawText ("OUTPUT", 18, 208, 76, 18, juce::Justification::centred);
     g.drawText ("MIX", 100, 208, 76, 18, juce::Justification::centred);
     g.drawText ("INFLUENCE", 18, 333, 76, 18, juce::Justification::centred);
-    g.drawText ("STRENGTH", 100, 333, 76, 18, juce::Justification::centred);
+    g.drawText ("VOICE MATCH", 96, 333, 84, 18, juce::Justification::centred);
 
     const int rightX = getWidth() - 198;
 
