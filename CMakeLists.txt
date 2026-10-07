@@ -125,6 +125,7 @@ target_compile_definitions(DnniInspector PUBLIC
 
 target_link_libraries(DnniInspector PRIVATE
   juce::juce_core
+  juce::juce_cryptography
   PUBLIC
   juce::juce_recommended_config_flags
   juce::juce_recommended_warning_flags
@@ -149,6 +150,7 @@ target_compile_definitions(DnniReaderTests PUBLIC
 
 target_link_libraries(DnniReaderTests PRIVATE
   juce::juce_core
+  juce::juce_cryptography
   PUBLIC
   juce::juce_recommended_config_flags
   juce::juce_recommended_warning_flags
