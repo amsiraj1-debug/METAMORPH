@@ -28,6 +28,47 @@ int main()
         return 1;
     }
 
+
+    {
+        const auto tempDir = juce::File::getSpecialLocation (juce::File::tempDirectory);
+        const auto dnniTestFile = tempDir.getNonexistentChildFile ("metamorph-dnni-smoke", ".dnni");
+
+        if (auto output = dnniTestFile.createOutputStream())
+        {
+            const unsigned char header[8] { 0xff, 0x00, 0xca, 0x7f, 0x02, 0x00, 0x00, 0x00 };
+            output->write (header, 8);
+            output->setPosition (1024 * 1024 + 64);
+            output->writeByte (0);
+            output->flush();
+        }
+
+        juce::String dnniError;
+        if (! processor.loadDnniModel (dnniTestFile, dnniError))
+        {
+            std::cerr << "FAIL: valid DNnI container signature was rejected: "
+                      << dnniError << "\n";
+            dnniTestFile.deleteFile();
+            return 8;
+        }
+
+        if (processor.isDnniReady())
+        {
+            std::cerr << "FAIL: test unexpectedly found a DNNI runtime bridge\n";
+            dnniTestFile.deleteFile();
+            return 9;
+        }
+
+        if (! processor.getDnniStatus().containsIgnoreCase ("runtime"))
+        {
+            std::cerr << "FAIL: DNnI fallback status did not explain runtime requirement\n";
+            dnniTestFile.deleteFile();
+            return 10;
+        }
+
+        processor.clearDnniModel();
+        dnniTestFile.deleteFile();
+    }
+
     processor.setMorphPointFromUI (profiles.front().position.x, profiles.front().position.y);
     processor.setInfluenceFromUI (0.28f);
 
