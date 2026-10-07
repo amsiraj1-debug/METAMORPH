@@ -24,6 +24,56 @@ struct DnniRegion
     DnniRegionKind kind { DnniRegionKind::Unknown };
 };
 
+struct DnniRecordInfo
+{
+    std::array<uint8_t, 4> marker {};
+    std::array<uint8_t, 12> identifier {};
+    juce::int64 recordOffset { 0 };
+    juce::int64 payloadOffset { 0 };
+    uint32_t payloadSize { 0 };
+};
+
+struct DnniQuantMatrixInfo
+{
+    int recordIndex { -1 };
+    uint32_t code { 0 };
+    uint32_t rows { 0 };
+    uint32_t cols { 0 };
+    juce::int64 scalesOffset { 0 };
+    juce::int64 weightsOffset { 0 };
+};
+
+struct DnniFloatVectorInfo
+{
+    int recordIndex { -1 };
+    uint32_t count { 0 };
+    juce::int64 dataOffset { 0 };
+};
+
+struct DnniConv1DInfo
+{
+    int recordIndex { -1 };
+    uint32_t kernelSize { 0 };
+    uint32_t stride { 0 };
+    uint32_t padding { 0 };
+    uint32_t dilation { 0 };
+    uint32_t groups { 0 };
+};
+
+struct DnniNativeModelInfo
+{
+    juce::File file;
+    juce::int64 fileSize { 0 };
+    int recordCount { 0 };
+    int marker40Count { 0 };
+    int marker41Count { 0 };
+    bool consumedExactly { false };
+    std::vector<DnniRecordInfo> records;
+    std::vector<DnniQuantMatrixInfo> quantMatrices;
+    std::vector<DnniFloatVectorInfo> floatVectors;
+    std::vector<DnniConv1DInfo> conv1dOps;
+};
+
 struct DnniInspectionReport
 {
     juce::File file;
@@ -48,6 +98,25 @@ public:
                   int blockSize = defaultBlockSize) const;
 
     static juce::String kindToString (DnniRegionKind kind);
+
+    bool parseNativeModel (const juce::File& file,
+                           DnniNativeModelInfo& model,
+                           juce::String& errorMessage) const;
+
+    bool readQuantMatrixScales (const DnniNativeModelInfo& model,
+                                int matrixIndex,
+                                std::vector<float>& scales,
+                                juce::String& errorMessage) const;
+
+    bool readQuantMatrixRow (const DnniNativeModelInfo& model,
+                             int matrixIndex,
+                             int row,
+                             std::vector<float>& output,
+                             juce::String& errorMessage) const;
+
+    bool deriveModelSpectralSignature (const DnniNativeModelInfo& model,
+                                       std::array<float, 10>& signatureDb,
+                                       juce::String& errorMessage) const;
 
 private:
     static double calculateEntropy (const uint8_t* data, size_t size);
