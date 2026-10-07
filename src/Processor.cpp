@@ -167,12 +167,36 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
             {
                 midiMorphX.store (waypointX[(size_t) index].load());
                 midiMorphY.store (waypointY[(size_t) index].load());
+                midiRadius.store (waypointRadius[(size_t) index].load());
                 midiMorphOverride.store (true);
                 activeWaypoint.store (index);
             }
-            else if (msg.getNoteNumber() == 44)
+            else if (msg.getNoteNumber() == 44 && waypointCount.load() > 0)
             {
-                midiMorphOverride.store (false);
+                midiMorphX.store (waypointX[0].load());
+                midiMorphY.store (waypointY[0].load());
+                midiRadius.store (waypointRadius[0].load());
+                midiMorphOverride.store (true);
+                activeWaypoint.store (0);
+            }
+            else if (msg.getNoteNumber() == 45 && waypointCount.load() > 0)
+            {
+                const int next = (activeWaypoint.load() + 1 + waypointCount.load()) % waypointCount.load();
+                midiMorphX.store (waypointX[(size_t) next].load());
+                midiMorphY.store (waypointY[(size_t) next].load());
+                midiRadius.store (waypointRadius[(size_t) next].load());
+                midiMorphOverride.store (true);
+                activeWaypoint.store (next);
+            }
+            else if (msg.getNoteNumber() == 46 && waypointCount.load() > 0)
+            {
+                int previous = activeWaypoint.load() - 1;
+                if (previous < 0) previous = waypointCount.load() - 1;
+                midiMorphX.store (waypointX[(size_t) previous].load());
+                midiMorphY.store (waypointY[(size_t) previous].load());
+                midiRadius.store (waypointRadius[(size_t) previous].load());
+                midiMorphOverride.store (true);
+                activeWaypoint.store (previous);
             }
         }
         else if (msg.isController())
@@ -572,6 +596,7 @@ void MorphProcessor::applyParameterValue (const juce::String& id, float plainVal
 void MorphProcessor::setMorphPointFromUI (float x, float y)
 {
     midiMorphOverride.store (false);
+    activeWaypoint.store (-1);
     applyParameterValue ("morphX", juce::jlimit (0.0f, 1.0f, x));
     applyParameterValue ("morphY", juce::jlimit (0.0f, 1.0f, y));
 }
@@ -615,6 +640,24 @@ float MorphProcessor::getWaypointRadius (int index) const
         return 0.34f;
 
     return waypointRadius[(size_t) index].load();
+}
+
+juce::Point<float> MorphProcessor::getEffectiveMorphPoint() const
+{
+    if (midiMorphOverride.load())
+        return { midiMorphX.load(), midiMorphY.load() };
+
+    return {
+        parameters.getRawParameterValue ("morphX")->load(),
+        parameters.getRawParameterValue ("morphY")->load()
+    };
+}
+
+float MorphProcessor::getEffectiveRadius() const
+{
+    return midiMorphOverride.load()
+        ? midiRadius.load()
+        : parameters.getRawParameterValue ("radius")->load();
 }
 
 void MorphProcessor::activateWaypoint (int index)
