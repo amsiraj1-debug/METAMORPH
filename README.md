@@ -16,10 +16,11 @@ This project recreates the **workflow and functional ideas** of a reference-voic
 - 40 procedural starter profiles, generated locally from code
 - Pre-gain, output gain and dry/wet controls
 - Real-time pitch shifting
-- Host automation for morph X/Y, influence radius, pitch, gain and mix
+- Host automation for morph X/Y, influence radius, pitch, gain, transform strength and mix
 - Four realtime/quality modes
-- MIDI waypoint recall (notes 36-43) plus MIDI CC morph control (20/21/22)
-- Up to 8 saved waypoints
+- MIDI waypoint recall (notes 36-43 / C2-G2) plus MIDI CC morph control (20/21/22)
+- Up to 8 saved waypoints; each waypoint stores cursor X/Y and influence radius
+- Direct 1-8 waypoint buttons plus next/previous recall and a visible route in the workspace
 - Target pitch-range display
 - Input/output meters
 - Full plugin-state serialization including target profiles and waypoints
@@ -27,7 +28,9 @@ This project recreates the **workflow and functional ideas** of a reference-voic
 
 ## DSP implementation
 
-The live engine is an original spectral-envelope morphing processor. Imported references are analyzed into frequency-band profiles, then the current 2D cursor position blends or subtracts those profiles in real time. The pitch shifter uses an original dual-delay granular-style implementation.
+The live engine is an original spectral-envelope morphing processor. Imported references are analyzed into frequency-band profiles, then the current 2D cursor position blends or subtracts those profiles in real time. Version 0.3 adds a stronger 0-200% Transform Strength stage, expanded formant/body/presence/air shaping and target-dependent soft harmonic coloration so reference changes are clearly audible. The pitch shifter uses an original dual-delay granular-style implementation.
+
+A **waypoint** is a saved light-cursor state for performance recall. Move the light to a useful blend, adjust its influence radius, press **+ WAYPOINT**, then recall that state with buttons 1-8, Previous/Next, or MIDI notes C2-G2. Waypoints do not automatically sequence themselves; use DAW automation or MIDI/shortcuts when you want timed movement.
 
 This is **not** a binary patch, license bypass, or decompilation of proprietary DSP.
 
