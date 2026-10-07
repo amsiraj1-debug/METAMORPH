@@ -52,12 +52,14 @@ private:
     juce::Label subtitleLabel;
     juce::Label statusLabel;
     juce::Label latencyLabel;
+    juce::Label waypointInfoLabel;
 
     juce::Slider preGainSlider;
     juce::Slider pitchSlider;
     juce::Slider outputSlider;
     juce::Slider mixSlider;
     juce::Slider radiusSlider;
+    juce::Slider strengthSlider;
     juce::Slider voiceSpaceSlider;
     juce::Slider toneSlider;
 
@@ -79,6 +81,7 @@ private:
     juce::TextButton previousWaypointButton { "<" };
     juce::TextButton nextWaypointButton { ">" };
     juce::TextButton clearWaypointsButton { "CLEAR WP" };
+    std::array<juce::TextButton, 8> waypointButtons;
 
     std::unique_ptr<juce::FileChooser> chooser;
 
@@ -91,6 +94,7 @@ private:
     std::unique_ptr<SliderAttachment> outputAttachment;
     std::unique_ptr<SliderAttachment> mixAttachment;
     std::unique_ptr<SliderAttachment> radiusAttachment;
+    std::unique_ptr<SliderAttachment> strengthAttachment;
     std::unique_ptr<ComboAttachment> qualityAttachment;
     std::unique_ptr<ComboAttachment> inputModeAttachment;
     std::unique_ptr<ButtonAttachment> realtimeAttachment;
