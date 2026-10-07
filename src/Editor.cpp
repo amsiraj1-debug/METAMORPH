@@ -729,9 +729,9 @@ void MorphEditor::resized()
     voiceList.setBounds (rx, 350, 180, 30);
     removeButton.setBounds (rx, 390, 86, 30);
     clearButton.setBounds (rx + 94, 390, 86, 30);
-    loadDnniButton.setBounds (rx, 460, 118, 30);
-    clearDnniButton.setBounds (rx + 124, 460, 56, 30);
-    dnniStatusLabel.setBounds (rx, 496, 180, 96);
+    loadDnniButton.setBounds (rx, 460, 180, 30);
+    clearDnniButton.setBounds (rx, 496, 180, 28);
+    dnniStatusLabel.setBounds (rx, 532, 180, 90);
 
     const int centreX = 194;
     const int centreW = w - 194 - 214;
