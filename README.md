@@ -60,3 +60,24 @@ The repository now supports selecting a `.dnni` model from the plugin UI with **
 The plugin validates the DNnI container, stores the model selection in plugin state, and routes the wet vocal through a dedicated DNnI backend whenever a compatible authorized runtime bridge is available. If no runtime bridge is installed, the UI states that clearly and the existing Reference Match processor remains active.
 
 See `docs/DNNI_BACKEND.md` for the adapter ABI and runtime setup. The proprietary `.dnni` model itself is intentionally excluded from Git.
+
+
+## DNnI Inspector
+
+The repository now includes a clean-room binary inspector for unprotected `.dnni` container structure. It does **not** decrypt protected sections or bypass access controls.
+
+Build:
+
+```powershell
+cmake --build build --config Release --target DnniInspector
+```
+
+Run:
+
+```powershell
+DnniInspector.exe model.dnni model-report.json
+```
+
+The JSON report contains the file size and SHA-256, signature/header bytes, merged block regions, entropy/printable/zero ratios, classifications for plain text, candidate FP32/FP16/INT8 weight regions, high-entropy opaque regions, and extracted printable strings. The classifier is heuristic: a candidate numeric region is not proof that a tensor has been decoded.
+
+GitHub Actions packages the inspector as `DnniInspector.exe` beside the VST3/standalone build. The next clean-room step is to use reports from known authorized DNnI models to infer stable container tables, tensor dimensions, and operator metadata where those structures are stored in clear form.
