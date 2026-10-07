@@ -104,7 +104,9 @@ void MorphProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     airShelf.reset();
 
     pitchShifter.prepare (sampleRate, samplesPerBlock, channels);
+    dnniBackend.prepare (sampleRate, samplesPerBlock, channels);
     dryBuffer.setSize (channels, samplesPerBlock, false, false, true);
+    modelWorkBuffer.setSize (channels, samplesPerBlock, false, false, true);
 
     liveAnalysisRing.fill (0.0f);
     liveFftData.fill (0.0f);
@@ -301,6 +303,25 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
 
     buffer.applyGain (juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("pregain")->load()));
 
+    bool dnniProcessed = false;
+
+    if (dnniBackend.isReady())
+    {
+        if (modelWorkBuffer.getNumChannels() != numChannels || modelWorkBuffer.getNumSamples() < numSamples)
+            modelWorkBuffer.setSize (numChannels, numSamples, false, false, true);
+
+        for (int ch = 0; ch < numChannels; ++ch)
+            modelWorkBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
+
+        dnniProcessed = dnniBackend.process (modelWorkBuffer);
+
+        if (dnniProcessed)
+        {
+            for (int ch = 0; ch < numChannels; ++ch)
+                buffer.copyFrom (ch, 0, modelWorkBuffer, ch, 0, numSamples);
+        }
+    }
+
     pitchShifter.setSemitones (parameters.getRawParameterValue ("pitch")->load());
     pitchShifter.process (buffer);
 
@@ -308,49 +329,52 @@ void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
     const float y = midiMorphOverride.load() ? midiMorphY.load() : parameters.getRawParameterValue ("morphY")->load();
     const float radius = midiMorphOverride.load() ? midiRadius.load() : parameters.getRawParameterValue ("radius")->load();
 
-    const auto targetProfileDb = computeMorphBandGains (x, y, radius);
-    const float strength = parameters.getRawParameterValue ("strength")->load() * 0.01f;
-
-    std::array<float, VoiceProfile::bandCount> matchBandDb {};
-    for (int band = 0; band < VoiceProfile::bandCount; ++band)
+    if (! dnniProcessed)
     {
-        const float spectralDifference = targetProfileDb[(size_t) band] - liveSourceBandDb[(size_t) band];
-        matchBandDb[(size_t) band] = juce::jlimit (-18.0f, 18.0f, spectralDifference * strength);
+        const auto targetProfileDb = computeMorphBandGains (x, y, radius);
+        const float strength = parameters.getRawParameterValue ("strength")->load() * 0.01f;
+
+        std::array<float, VoiceProfile::bandCount> matchBandDb {};
+        for (int band = 0; band < VoiceProfile::bandCount; ++band)
+        {
+            const float spectralDifference = targetProfileDb[(size_t) band] - liveSourceBandDb[(size_t) band];
+            matchBandDb[(size_t) band] = juce::jlimit (-18.0f, 18.0f, spectralDifference * strength);
+        }
+
+        float correctionMean = 0.0f;
+        for (const auto value : matchBandDb)
+            correctionMean += value;
+        correctionMean /= (float) VoiceProfile::bandCount;
+
+        for (auto& value : matchBandDb)
+            value -= correctionMean;
+
+        updateFilterTargets (matchBandDb);
+
+        const float bodyDb = juce::jlimit (-9.0f, 9.0f,
+            (matchBandDb[0] + matchBandDb[1] + matchBandDb[2]) / 3.0f * 0.48f);
+        const float presenceDb = juce::jlimit (-9.0f, 9.0f,
+            (matchBandDb[5] + matchBandDb[6] + matchBandDb[7]) / 3.0f * 0.48f);
+        const float airDb = juce::jlimit (-7.0f, 7.0f,
+            (matchBandDb[8] + matchBandDb[9]) * 0.22f);
+
+        *bodyShelf.state = *juce::dsp::IIR::Coefficients<float>::makeLowShelf (
+            currentSampleRate, 220.0, 0.72, juce::Decibels::decibelsToGain (bodyDb));
+        *presenceShelf.state = *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+            currentSampleRate, juce::jmin (2400.0, currentSampleRate * 0.40), 0.72,
+            juce::Decibels::decibelsToGain (presenceDb));
+        *airShelf.state = *juce::dsp::IIR::Coefficients<float>::makeHighShelf (
+            currentSampleRate, juce::jmin (7000.0, currentSampleRate * 0.40), 0.72,
+            juce::Decibels::decibelsToGain (airDb));
+
+        juce::dsp::AudioBlock<float> block (buffer);
+        juce::dsp::ProcessContextReplacing<float> context (block);
+        for (auto& filter : bandFilters)
+            filter.process (context);
+        bodyShelf.process (context);
+        presenceShelf.process (context);
+        airShelf.process (context);
     }
-
-    float correctionMean = 0.0f;
-    for (const auto value : matchBandDb)
-        correctionMean += value;
-    correctionMean /= (float) VoiceProfile::bandCount;
-
-    for (auto& value : matchBandDb)
-        value -= correctionMean;
-
-    updateFilterTargets (matchBandDb);
-
-    const float bodyDb = juce::jlimit (-9.0f, 9.0f,
-        (matchBandDb[0] + matchBandDb[1] + matchBandDb[2]) / 3.0f * 0.48f);
-    const float presenceDb = juce::jlimit (-9.0f, 9.0f,
-        (matchBandDb[5] + matchBandDb[6] + matchBandDb[7]) / 3.0f * 0.48f);
-    const float airDb = juce::jlimit (-7.0f, 7.0f,
-        (matchBandDb[8] + matchBandDb[9]) * 0.22f);
-
-    *bodyShelf.state = *juce::dsp::IIR::Coefficients<float>::makeLowShelf (
-        currentSampleRate, 220.0, 0.72, juce::Decibels::decibelsToGain (bodyDb));
-    *presenceShelf.state = *juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-        currentSampleRate, juce::jmin (2400.0, currentSampleRate * 0.40), 0.72,
-        juce::Decibels::decibelsToGain (presenceDb));
-    *airShelf.state = *juce::dsp::IIR::Coefficients<float>::makeHighShelf (
-        currentSampleRate, juce::jmin (7000.0, currentSampleRate * 0.40), 0.72,
-        juce::Decibels::decibelsToGain (airDb));
-
-    juce::dsp::AudioBlock<float> block (buffer);
-    juce::dsp::ProcessContextReplacing<float> context (block);
-    for (auto& filter : bandFilters)
-        filter.process (context);
-    bodyShelf.process (context);
-    presenceShelf.process (context);
-    airShelf.process (context);
 
     const float preGainLinear =
         juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("pregain")->load());
@@ -692,6 +716,16 @@ std::vector<VoiceProfile> MorphProcessor::getProfilesSnapshot() const
     return profiles;
 }
 
+bool MorphProcessor::loadDnniModel (const juce::File& file, juce::String& errorMessage)
+{
+    return dnniBackend.loadModel (file, errorMessage);
+}
+
+void MorphProcessor::clearDnniModel()
+{
+    dnniBackend.clearModel();
+}
+
 void MorphProcessor::applyParameterValue (const juce::String& id, float plainValue)
 {
     if (auto* p = parameters.getParameter (id))
@@ -822,6 +856,12 @@ void MorphProcessor::getStateInformation (juce::MemoryBlock& destData)
     waypointsTree.setProperty ("active", activeWaypoint.load(), nullptr);
     state.addChild (waypointsTree, -1, nullptr);
 
+    juce::ValueTree dnniTree { "DNNI" };
+    const auto dnniFile = dnniBackend.getModelFile();
+    dnniTree.setProperty ("modelPath", dnniFile.getFullPathName(), nullptr);
+    dnniTree.setProperty ("runtimeReady", dnniBackend.isReady(), nullptr);
+    state.addChild (dnniTree, -1, nullptr);
+
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -838,13 +878,26 @@ void MorphProcessor::setStateInformation (const void* data, int sizeInBytes)
 
     auto voicesTree = tree.getChildWithName ("VOICES");
     auto waypointsTree = tree.getChildWithName ("WAYPOINTS");
+    auto dnniTree = tree.getChildWithName ("DNNI");
 
     if (voicesTree.isValid())
         tree.removeChild (voicesTree, nullptr);
     if (waypointsTree.isValid())
         tree.removeChild (waypointsTree, nullptr);
+    if (dnniTree.isValid())
+        tree.removeChild (dnniTree, nullptr);
 
     parameters.replaceState (tree);
+
+    if (dnniTree.isValid())
+    {
+        const auto modelPath = dnniTree.getProperty ("modelPath").toString();
+        if (modelPath.isNotEmpty())
+        {
+            juce::String error;
+            dnniBackend.loadModel (juce::File (modelPath), error);
+        }
+    }
 
     if (voicesTree.isValid())
     {
