@@ -74,36 +74,29 @@ void MorphCanvas::paint (juce::Graphics& g)
         }
 
         juce::Path curve;
+        std::array<juce::Point<float>, VoiceProfile::bandCount> points {};
+
         for (int i = 0; i < VoiceProfile::bandCount; ++i)
         {
-            const float angle = juce::MathConstants<float>::twoPi * (float) i / (float) VoiceProfile::bandCount;
-            const float radial = 13.0f + std::abs (profile.bandDb[(size_t) i]) * 0.7f;
-            const auto point = centre + juce::Point<float> (
-                std::cos (angle) * radial,
-                std::sin (angle) * radial * 0.55f);
+            const float dx = ((float) i - 4.5f) * 8.5f;
+            const float timbreY = profile.bandDb[(size_t) i] * 1.05f;
+            const float pitchArc = std::sin ((float) i / 9.0f * juce::MathConstants<float>::pi) * 8.0f;
+            points[(size_t) i] = centre + juce::Point<float> (dx, timbreY - pitchArc);
 
             if (i == 0)
-                curve.startNewSubPath (point);
+                curve.startNewSubPath (points[(size_t) i]);
             else
-                curve.lineTo (point);
+                curve.lineTo (points[(size_t) i]);
         }
 
-        curve.closeSubPath();
+        g.setColour (profile.colour.withAlpha (0.22f + influence * 0.22f));
+        g.strokePath (curve, juce::PathStrokeType (2.0f + influence * 1.2f));
 
-        g.setColour (profile.colour.withAlpha (0.16f + influence * 0.18f));
-        g.fillPath (curve);
-        g.setColour (profile.colour.withAlpha (0.78f));
-        g.strokePath (curve, juce::PathStrokeType (1.7f));
-
-        for (int i = 0; i < VoiceProfile::bandCount; i += 2)
+        for (int i = 0; i < VoiceProfile::bandCount; ++i)
         {
-            const float angle = juce::MathConstants<float>::twoPi * (float) i / (float) VoiceProfile::bandCount;
-            const float radial = 13.0f + std::abs (profile.bandDb[(size_t) i]) * 0.7f;
-            const auto point = centre + juce::Point<float> (
-                std::cos (angle) * radial,
-                std::sin (angle) * radial * 0.55f);
-
-            g.fillEllipse (juce::Rectangle<float> (4.0f, 4.0f).withCentre (point));
+            const float size = (i % 3 == 0 ? 5.5f : 4.0f) + influence * 1.5f;
+            g.setColour (profile.colour.withAlpha (0.65f + influence * 0.30f));
+            g.fillEllipse (juce::Rectangle<float> (size, size).withCentre (points[(size_t) i]));
         }
 
         g.setColour (juce::Colour (textColour));
@@ -127,6 +120,18 @@ void MorphCanvas::paint (juce::Graphics& g)
             juce::Rectangle<float> (centre.x - 55.0f, centre.y + 38.0f, 110.0f, 15.0f),
             juce::Justification::centred,
             false);
+    }
+
+    if (processor.getWaypointCount() > 1)
+    {
+        juce::Path route;
+        route.startNewSubPath (fromNormalised (processor.getWaypoint (0)));
+
+        for (int i = 1; i < processor.getWaypointCount(); ++i)
+            route.lineTo (fromNormalised (processor.getWaypoint (i)));
+
+        g.setColour (juce::Colour (accentColour).withAlpha (0.24f));
+        g.strokePath (route, juce::PathStrokeType (1.4f));
     }
 
     for (int i = 0; i < processor.getWaypointCount(); ++i)
@@ -287,6 +292,12 @@ MorphEditor::MorphEditor (MorphProcessor& p)
     latencyLabel.setJustificationType (juce::Justification::centredRight);
     addAndMakeVisible (latencyLabel);
 
+    waypointInfoLabel.setText ("WAYPOINTS  •  saved light positions  •  MIDI C2-G2", juce::dontSendNotification);
+    waypointInfoLabel.setColour (juce::Label::textColourId, juce::Colour (mutedColour));
+    waypointInfoLabel.setFont (juce::Font (juce::FontOptions (10.5f)));
+    waypointInfoLabel.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (waypointInfoLabel);
+
     morphCanvas.onStatus = [this] (const juce::String& s)
     {
         showStatus (s);
@@ -299,6 +310,7 @@ MorphEditor::MorphEditor (MorphProcessor& p)
     configureSlider (outputSlider, " dB");
     configureSlider (mixSlider, " %");
     configureSlider (radiusSlider);
+    configureSlider (strengthSlider, " %");
     configureSlider (voiceSpaceSlider);
     configureSlider (toneSlider);
 
@@ -307,6 +319,7 @@ MorphEditor::MorphEditor (MorphProcessor& p)
     outputSlider.setRange (-24.0, 24.0, 0.1);
     mixSlider.setRange (0.0, 100.0, 0.1);
     radiusSlider.setRange (0.08, 0.75, 0.001);
+    strengthSlider.setRange (0.0, 200.0, 0.1);
     voiceSpaceSlider.setRange (0.0, 1.0, 0.001);
     toneSlider.setRange (0.0, 1.0, 0.001);
     voiceSpaceSlider.setValue (0.5);
@@ -318,6 +331,7 @@ MorphEditor::MorphEditor (MorphProcessor& p)
         &outputSlider,
         &mixSlider,
         &radiusSlider,
+        &strengthSlider,
         &voiceSpaceSlider,
         &toneSlider
     })
@@ -373,6 +387,20 @@ MorphEditor::MorphEditor (MorphProcessor& p)
         button->setColour (juce::TextButton::buttonOnColourId, juce::Colour (accentColour));
         button->setColour (juce::TextButton::textColourOffId, juce::Colour (textColour));
         addAndMakeVisible (*button);
+    }
+
+    for (int i = 0; i < (int) waypointButtons.size(); ++i)
+    {
+        waypointButtons[(size_t) i].setButtonText (juce::String (i + 1));
+        waypointButtons[(size_t) i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xff252c38));
+        waypointButtons[(size_t) i].setColour (juce::TextButton::textColourOffId, juce::Colour (textColour));
+        waypointButtons[(size_t) i].onClick = [this, i]
+        {
+            processor.activateWaypoint (i);
+            morphCanvas.repaint();
+            showStatus ("Waypoint " + juce::String (i + 1) + " recalled");
+        };
+        addAndMakeVisible (waypointButtons[(size_t) i]);
     }
 
     importButton.onClick = [this]
@@ -434,26 +462,37 @@ MorphEditor::MorphEditor (MorphProcessor& p)
 
     saveWaypointButton.onClick = [this]
     {
+        if (processor.getWaypointCount() >= 8)
+        {
+            showStatus ("Maximum 8 waypoints reached");
+            return;
+        }
+
         processor.addWaypointFromCurrent();
         morphCanvas.repaint();
+        showStatus ("Saved waypoint " + juce::String (processor.getWaypointCount())
+                    + " (cursor position + influence radius)");
     };
 
     previousWaypointButton.onClick = [this]
     {
         processor.activatePreviousWaypoint();
         morphCanvas.repaint();
+        showStatus ("Previous waypoint");
     };
 
     nextWaypointButton.onClick = [this]
     {
         processor.activateNextWaypoint();
         morphCanvas.repaint();
+        showStatus ("Next waypoint");
     };
 
     clearWaypointsButton.onClick = [this]
     {
         processor.clearWaypoints();
         morphCanvas.repaint();
+        showStatus ("Waypoints cleared");
     };
 
     preGainAttachment = std::make_unique<SliderAttachment> (processor.parameters, "pregain", preGainSlider);
@@ -461,6 +500,7 @@ MorphEditor::MorphEditor (MorphProcessor& p)
     outputAttachment = std::make_unique<SliderAttachment> (processor.parameters, "output", outputSlider);
     mixAttachment = std::make_unique<SliderAttachment> (processor.parameters, "mix", mixSlider);
     radiusAttachment = std::make_unique<SliderAttachment> (processor.parameters, "radius", radiusSlider);
+    strengthAttachment = std::make_unique<SliderAttachment> (processor.parameters, "strength", strengthSlider);
     qualityAttachment = std::make_unique<ComboAttachment> (processor.parameters, "quality", qualityBox);
     inputModeAttachment = std::make_unique<ComboAttachment> (processor.parameters, "inputMode", inputModeBox);
     realtimeAttachment = std::make_unique<ButtonAttachment> (processor.parameters, "realtime", realtimeButton);
@@ -567,7 +607,8 @@ void MorphEditor::paint (juce::Graphics& g)
     g.drawText ("PITCH", 100, 83, 76, 18, juce::Justification::centred);
     g.drawText ("OUTPUT", 18, 208, 76, 18, juce::Justification::centred);
     g.drawText ("MIX", 100, 208, 76, 18, juce::Justification::centred);
-    g.drawText ("INFLUENCE", 59, 333, 78, 18, juce::Justification::centred);
+    g.drawText ("INFLUENCE", 18, 333, 76, 18, juce::Justification::centred);
+    g.drawText ("STRENGTH", 100, 333, 76, 18, juce::Justification::centred);
 
     const int rightX = getWidth() - 198;
 
@@ -618,15 +659,12 @@ void MorphEditor::resized()
     pitchSlider.setBounds (98, 101, 82, 102);
     outputSlider.setBounds (14, 226, 82, 102);
     mixSlider.setBounds (98, 226, 82, 102);
-    radiusSlider.setBounds (56, 351, 84, 102);
+    radiusSlider.setBounds (14, 351, 82, 102);
+    strengthSlider.setBounds (98, 351, 82, 102);
 
     inputModeBox.setBounds (18, 468, 158, 28);
     importButton.setBounds (18, 510, 158, 32);
     presetBox.setBounds (18, 550, 158, 28);
-    saveWaypointButton.setBounds (18, 590, 102, 30);
-    previousWaypointButton.setBounds (124, 590, 24, 30);
-    nextWaypointButton.setBounds (152, 590, 24, 30);
-    clearWaypointsButton.setBounds (18, 626, 158, 28);
 
     const int rx = w - 198;
 
@@ -638,7 +676,24 @@ void MorphEditor::resized()
     removeButton.setBounds (rx, 390, 86, 30);
     clearButton.setBounds (rx + 94, 390, 86, 30);
 
-    morphCanvas.setBounds (194, 64, w - 194 - 214, h - 96);
+    const int centreX = 194;
+    const int centreW = w - 194 - 214;
+    morphCanvas.setBounds (centreX, 64, centreW, h - 164);
+
+    const int waypointY = h - 92;
+    waypointInfoLabel.setBounds (centreX + 18, waypointY - 20, centreW - 36, 18);
+    saveWaypointButton.setBounds (centreX + 18, waypointY, 104, 30);
+    previousWaypointButton.setBounds (centreX + 128, waypointY, 30, 30);
+    nextWaypointButton.setBounds (centreX + 162, waypointY, 30, 30);
+
+    int buttonX = centreX + 204;
+    for (int i = 0; i < (int) waypointButtons.size(); ++i)
+    {
+        waypointButtons[(size_t) i].setBounds (buttonX, waypointY, 30, 30);
+        buttonX += 34;
+    }
+
+    clearWaypointsButton.setBounds (centreX + centreW - 86, waypointY, 68, 30);
 }
 
 void MorphEditor::timerCallback()
@@ -654,6 +709,18 @@ void MorphEditor::timerCallback()
     latencyLabel.setText (
         "mode " + juce::String (latencies[juce::jlimit (0, 3, quality)]) + " ms",
         juce::dontSendNotification);
+
+    const int waypointCount = processor.getWaypointCount();
+    const int activeWaypoint = processor.getActiveWaypoint();
+
+    for (int i = 0; i < (int) waypointButtons.size(); ++i)
+    {
+        waypointButtons[(size_t) i].setEnabled (i < waypointCount);
+        waypointButtons[(size_t) i].setColour (
+            juce::TextButton::buttonColourId,
+            i == activeWaypoint ? juce::Colour (accentColour).darker (0.45f)
+                                : juce::Colour (0xff252c38));
+    }
 
     morphCanvas.repaint();
     repaint();
