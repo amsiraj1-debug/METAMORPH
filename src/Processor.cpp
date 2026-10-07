@@ -1,241 +1,677 @@
 #include "Processor.h"
 #include "Editor.h"
+#include <algorithm>
+#include <limits>
+#include <numeric>
 
-juce::AudioProcessorValueTreeState::ParameterLayout MorphProcessor::layout()
+namespace
 {
-    std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
-    p.push_back(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID("mix",1),"Mix",0.0f,1.0f,1.0f));
-    p.push_back(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID("pitch",1),"Pitch",juce::NormalisableRange<float>(-24,24,1),0));
-    p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID("bypass",1),"Bypass",false));
-    return {p.begin(),p.end()};
+constexpr std::array<double, VoiceProfile::bandCount> bandCentres {
+    90.0, 160.0, 280.0, 500.0, 900.0, 1600.0, 2900.0, 5200.0, 9000.0, 14500.0
+};
+
+constexpr std::array<double, VoiceProfile::bandCount + 1> bandEdges {
+    55.0, 120.0, 210.0, 370.0, 660.0, 1180.0, 2100.0, 3750.0, 6650.0, 11200.0, 19000.0
+};
+
+juce::String colourToHex (juce::Colour c)
+{
+    return juce::String::formatted ("#%02X%02X%02X", c.getRed(), c.getGreen(), c.getBlue());
+}
+
+juce::Colour colourFromHex (juce::String text)
+{
+    text = text.trim().removeCharacters ("#");
+    if (text.length() != 6)
+        return juce::Colours::cornflowerblue;
+
+    const auto rgb = (juce::uint32) text.getHexValue32();
+    return juce::Colour::fromRGB ((juce::uint8) ((rgb >> 16) & 0xff),
+                                  (juce::uint8) ((rgb >> 8) & 0xff),
+                                  (juce::uint8) (rgb & 0xff));
+}
 }
 
 MorphProcessor::MorphProcessor()
- : AudioProcessor(BusesProperties().withInput("Input",juce::AudioChannelSet::stereo(),true).withOutput("Output",juce::AudioChannelSet::stereo(),true)),
-   Thread("Voice transformation"),parameters(*this,nullptr,"MetamorphRebuild",layout())
+    : AudioProcessor (BusesProperties()
+                        .withInput ("Input", juce::AudioChannelSet::stereo(), true)
+                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      parameters (*this, nullptr, "METAMORPH_STATE", layout())
 {
-    const auto cache=juce::SystemStats::getEnvironmentVariable("METAMORPH_CACHE_DIR",{});
-    auto parent=cache.isNotEmpty()?juce::File(cache):juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("MetamorphRebuild/sessions");
-    sessionFolder=parent.getChildFile(juce::Uuid().toString());
-}
-MorphProcessor::~MorphProcessor() { signalThreadShouldExit(); stopThread(5000); }
-bool MorphProcessor::isBusesLayoutSupported(const BusesLayout& b) const
-{
-    return b.getMainInputChannelSet()==b.getMainOutputChannelSet() && (b.getMainOutputChannelSet()==juce::AudioChannelSet::mono() || b.getMainOutputChannelSet()==juce::AudioChannelSet::stereo());
-}
-void MorphProcessor::prepareToPlay(double rate,int)
-{
-    // Changes in rate invalidate timing; never play a stale buffer at the wrong rate.
-    const juce::SpinLock::ScopedLockType lock(audioLock);
-    if (sampleRate.load()!=rate || captured.getNumSamples()==0)
+    formatManager.registerBasicFormats();
+
+    for (int i = 0; i < 8; ++i)
     {
-        armed=false; preview=false; recordedSamples=0; resultReady=false;
-        captured.setSize(1,(int)std::ceil(rate*180.0));
-        transformed.setSize(1,0);
+        waypointX[(size_t) i].store (0.5f);
+        waypointY[(size_t) i].store (0.5f);
     }
-    sampleRate=rate;fallbackSample=0;
 }
-void MorphProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer&)
+
+MorphProcessor::APVTS::ParameterLayout MorphProcessor::layout()
+{
+    APVTS::ParameterLayout out;
+
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "pregain", 1 }, "Pre Gain",
+                                                           juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "output", 1 }, "Output Gain",
+                                                           juce::NormalisableRange<float> (-24.0f, 24.0f, 0.1f), 0.0f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "mix", 1 }, "Dry Wet",
+                                                           juce::NormalisableRange<float> (0.0f, 100.0f, 0.1f), 100.0f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "pitch", 1 }, "Pitch Shift",
+                                                           juce::NormalisableRange<float> (-12.0f, 12.0f, 0.01f), 0.0f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "morphX", 1 }, "Morph X",
+                                                           juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.5f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "morphY", 1 }, "Morph Y",
+                                                           juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.5f));
+    out.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "radius", 1 }, "Influence Radius",
+                                                           juce::NormalisableRange<float> (0.08f, 0.75f, 0.0001f), 0.34f));
+    out.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "realtime", 1 }, "Realtime Mode", true));
+    out.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "quality", 1 }, "Quality",
+                                                            juce::StringArray { "Lowest Latency", "Lower Latency", "Higher Quality", "Highest Quality" }, 1));
+    out.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "inputMode", 1 }, "Stereo Input",
+                                                            juce::StringArray { "Stereo / Auto", "Left", "Right" }, 0));
+    out.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "bypass", 1 }, "Bypass", false));
+    return out;
+}
+
+juce::AudioProcessorParameter* MorphProcessor::getBypassParameter() const
+{
+    return parameters.getParameter ("bypass");
+}
+
+void MorphProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    currentSampleRate = sampleRate;
+    const auto channels = juce::jmax (1, getTotalNumOutputChannels());
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) samplesPerBlock, (juce::uint32) channels };
+
+    for (int i = 0; i < VoiceProfile::bandCount; ++i)
+    {
+        bandFilters[(size_t) i].prepare (spec);
+        bandFilters[(size_t) i].reset();
+        smoothedBandDb[(size_t) i].reset (sampleRate, 0.06);
+        smoothedBandDb[(size_t) i].setCurrentAndTargetValue (0.0f);
+    }
+
+    pitchShifter.prepare (sampleRate, samplesPerBlock, channels);
+    dryBuffer.setSize (channels, samplesPerBlock, false, false, true);
+}
+
+bool MorphProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    const auto output = layouts.getMainOutputChannelSet();
+    if (output != juce::AudioChannelSet::mono() && output != juce::AudioChannelSet::stereo())
+        return false;
+
+    return output == layouts.getMainInputChannelSet();
+}
+
+float MorphProcessor::computePeak (const juce::AudioBuffer<float>& buffer)
+{
+    float peak = 0.0f;
+    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+        peak = juce::jmax (peak, buffer.getMagnitude (ch, 0, buffer.getNumSamples()));
+    return peak;
+}
+
+void MorphProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
-    for (int c=getTotalNumInputChannels();c<b.getNumChannels();++c)b.clear(c,0,b.getNumSamples());
-    const int n=b.getNumSamples();
-    if (n==0 || b.getNumChannels()==0)return;
-    meter=b.getRMSLevel(0,0,n);
-    bool playing=true;juce::int64 position=fallbackSample;
-    if (auto* head=getPlayHead())if (auto info=head->getPosition())
+    const int numChannels = buffer.getNumChannels();
+    const int numSamples = buffer.getNumSamples();
+
+    if (numSamples == 0 || numChannels == 0)
+        return;
+
+    inputMeter.store (computePeak (buffer));
+
+    if (parameters.getRawParameterValue ("bypass")->load() > 0.5f)
     {
-        playing=info->getIsPlaying();
-        if (auto samples=info->getTimeInSamples())position=*samples;
+        outputMeter.store (inputMeter.load());
+        return;
     }
-    lastHostSample=position;fallbackSample=position+n;
-    if(parameters.getRawParameterValue("bypass")->load()>.5f)return;
-    const juce::SpinLock::ScopedTryLockType lock(audioLock);
-    if (!lock.isLocked())return; // Audio callback never waits for file I/O or inference.
-    if (armed.load() && playing)
+
+    if (numChannels == 2)
     {
-        if (awaitingOrigin) { originSample=position;awaitingOrigin=false; }
-        const int start=recordedSamples.load();
-        const int count=juce::jmin(n,captured.getNumSamples()-start);
-        auto* dest=captured.getWritePointer(0)+start;
-        for(int i=0;i<count;++i)
+        const int inputMode = (int) parameters.getRawParameterValue ("inputMode")->load();
+        if (inputMode == 1)
+            buffer.copyFrom (1, 0, buffer, 0, 0, numSamples);
+        else if (inputMode == 2)
+            buffer.copyFrom (0, 0, buffer, 1, 0, numSamples);
+    }
+
+    if (dryBuffer.getNumChannels() != numChannels || dryBuffer.getNumSamples() < numSamples)
+        dryBuffer.setSize (numChannels, numSamples, false, false, true);
+
+    for (int ch = 0; ch < numChannels; ++ch)
+        dryBuffer.copyFrom (ch, 0, buffer, ch, 0, numSamples);
+
+    for (const auto metadata : midi)
+    {
+        const auto msg = metadata.getMessage();
+
+        if (msg.isNoteOn())
         {
-            float sum=0;for(int c=0;c<getTotalNumInputChannels();++c)sum+=b.getSample(c,i);
-            dest[i]=sum/(float)juce::jmax(1,getTotalNumInputChannels());
+            const int index = msg.getNoteNumber() - 36;
+            if (index >= 0 && index < waypointCount.load())
+            {
+                midiMorphX.store (waypointX[(size_t) index].load());
+                midiMorphY.store (waypointY[(size_t) index].load());
+                midiMorphOverride.store (true);
+                activeWaypoint.store (index);
+            }
+            else if (msg.getNoteNumber() == 44)
+            {
+                midiMorphOverride.store (false);
+            }
         }
-        recordedSamples=start+count;wasRecording=true;
-        if(count<n)armed=false;
+        else if (msg.isController())
+        {
+            const float value = (float) msg.getControllerValue() / 127.0f;
+            if (msg.getControllerNumber() == 20) { midiMorphX.store (value); midiMorphOverride.store (true); }
+            if (msg.getControllerNumber() == 21) { midiMorphY.store (value); midiMorphOverride.store (true); }
+            if (msg.getControllerNumber() == 22) { midiRadius.store (juce::jmap (value, 0.08f, 0.75f)); }
+        }
     }
-    else if (wasRecording && !playing) { armed=false;wasRecording=false; }
-    if(armed.load() || busy.load())return;
-    const bool audition=preview.load();
-    if(!audition && (!playing || !resultReady.load()))return;
-    const float mix=parameters.getRawParameterValue("mix")->load();
-    const int length=recordedSamples.load();
-    for(int i=0;i<n;++i)
+
+    buffer.applyGain (juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("pregain")->load()));
+
+    pitchShifter.setSemitones (parameters.getRawParameterValue ("pitch")->load());
+    pitchShifter.process (buffer);
+
+    const float x = midiMorphOverride.load() ? midiMorphX.load() : parameters.getRawParameterValue ("morphX")->load();
+    const float y = midiMorphOverride.load() ? midiMorphY.load() : parameters.getRawParameterValue ("morphY")->load();
+    const float radius = midiMorphOverride.load() ? midiRadius.load() : parameters.getRawParameterValue ("radius")->load();
+
+    updateFilterTargets (computeMorphBandGains (x, y, radius));
+
+    juce::dsp::AudioBlock<float> block (buffer);
+    juce::dsp::ProcessContextReplacing<float> context (block);
+    for (auto& filter : bandFilters)
+        filter.process (context);
+
+    const float wet = parameters.getRawParameterValue ("mix")->load() * 0.01f;
+    const float dry = 1.0f - wet;
+
+    for (int ch = 0; ch < numChannels; ++ch)
     {
-        const auto at=audition?(juce::int64)previewSample+i:position+i-originSample;
-        if(at<0 || at>=length)continue;
-        const float dry=captured.getSample(0,(int)at);
-        const float wet=resultReady.load()?transformed.getSample(0,(int)at):dry;
-        for(int c=0;c<b.getNumChannels();++c)
-            b.setSample(c,i,(audition?dry:b.getSample(c,i))*(1-mix)+wet*mix);
+        auto* out = buffer.getWritePointer (ch);
+        const auto* in = dryBuffer.getReadPointer (ch);
+
+        for (int s = 0; s < numSamples; ++s)
+            out[s] = out[s] * wet + in[s] * dry;
     }
-    if(audition) { previewSample+=n;if(previewSample>=length){preview=false;previewSample=0;} }
+
+    buffer.applyGain (juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("output")->load()));
+    outputMeter.store (computePeak (buffer));
 }
-juce::AudioProcessorEditor* MorphProcessor::createEditor(){return new MorphEditor(*this);}
-juce::AudioProcessorParameter* MorphProcessor::getBypassParameter() const { return parameters.getParameter("bypass"); }
-void MorphProcessor::message(juce::String text){const juce::ScopedLock lock(textLock);statusText=std::move(text);}
-juce::String MorphProcessor::status() const {const juce::ScopedLock lock(textLock);return statusText;}
-juce::String MorphProcessor::modelName() const {const juce::ScopedLock lock(textLock);return modelFile.getFileNameWithoutExtension();}
-bool MorphProcessor::setModel(const juce::File& file)
+
+std::array<float, VoiceProfile::bandCount> MorphProcessor::computeMorphBandGains (float x, float y, float radius) const
 {
-    if(busy)return false;
-    if(!file.existsAsFile() || !file.hasFileExtension("pth")){message("Choose an RVC .pth voice model.");return false;}
-    {const juce::ScopedLock lock(textLock);modelFile=file;}
-    message("Voice selected. Record or import audio, then transform.");return true;
+    std::array<float, VoiceProfile::bandCount> result {};
+    const juce::ScopedLock lock (profilesLock);
+
+    if (profiles.empty())
+        return result;
+
+    std::vector<float> weights;
+    weights.reserve (profiles.size());
+    float absSum = 0.0f;
+
+    for (const auto& profile : profiles)
+    {
+        const float dx = profile.position.x - x;
+        const float dy = profile.position.y - y;
+        const float d = std::sqrt (dx * dx + dy * dy);
+        float w = 0.0f;
+
+        if (d <= radius)
+        {
+            const float n = 1.0f - d / juce::jmax (0.001f, radius);
+            w = n * n;
+        }
+        else if (d < radius * 2.15f)
+        {
+            const float n = (d - radius) / juce::jmax (0.001f, radius * 1.15f);
+            w = -0.22f * juce::jlimit (0.0f, 1.0f, n);
+        }
+
+        weights.push_back (w);
+        absSum += std::abs (w);
+    }
+
+    if (absSum < 0.0001f)
+    {
+        size_t closest = 0;
+        float closestDistance = std::numeric_limits<float>::max();
+
+        for (size_t i = 0; i < profiles.size(); ++i)
+        {
+            const auto d = profiles[i].position.getDistanceFrom (juce::Point<float> (x, y));
+            if (d < closestDistance)
+            {
+                closestDistance = d;
+                closest = i;
+            }
+        }
+
+        weights.assign (profiles.size(), 0.0f);
+        weights[closest] = 1.0f;
+        absSum = 1.0f;
+    }
+
+    for (size_t i = 0; i < profiles.size(); ++i)
+        for (int band = 0; band < VoiceProfile::bandCount; ++band)
+            result[(size_t) band] += (weights[i] / absSum) * profiles[i].bandDb[(size_t) band];
+
+    for (auto& value : result)
+        value = juce::jlimit (-18.0f, 18.0f, value);
+
+    return result;
 }
-bool MorphProcessor::armRecord()
+
+void MorphProcessor::updateFilterTargets (const std::array<float, VoiceProfile::bandCount>& targetDb)
 {
-    if(busy)return false;
-    {const juce::SpinLock::ScopedLockType lock(audioLock);recordedSamples=0;resultReady=false;preview=false;awaitingOrigin=true;wasRecording=false;armed=true;}
-    message("Recording armed. Play your vocal track in the DAW.");return true;
+    const bool realtime = parameters.getRawParameterValue ("realtime")->load() > 0.5f;
+    const int quality = (int) parameters.getRawParameterValue ("quality")->load();
+    const float depth = realtime ? (0.82f + 0.06f * (float) quality) : 1.0f;
+
+    for (int i = 0; i < VoiceProfile::bandCount; ++i)
+    {
+        auto& smoother = smoothedBandDb[(size_t) i];
+        smoother.setTargetValue (targetDb[(size_t) i] * depth);
+        const float db = smoother.skip (64);
+        const double frequency = juce::jmin (bandCentres[(size_t) i], currentSampleRate * 0.45);
+
+        auto coeff = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
+            currentSampleRate, frequency, 0.82, juce::Decibels::decibelsToGain (db));
+
+        *bandFilters[(size_t) i].state = *coeff;
+    }
 }
-void MorphProcessor::stopRecord(){armed=false;message("Recording stopped. Ready to transform.");}
-void MorphProcessor::resetAudio()
+
+std::optional<VoiceProfile> MorphProcessor::analyseVoiceFile (const juce::File& file, juce::String& errorMessage)
 {
-    if(busy)return;
-    const juce::SpinLock::ScopedLockType lock(audioLock);armed=false;preview=false;recordedSamples=0;resultReady=false;progress=0;
-    message("Ready for a new recording.");
+    std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
+
+    if (reader == nullptr)
+    {
+        errorMessage = "Unsupported audio file. Use WAV, AIFF or FLAC.";
+        return std::nullopt;
+    }
+
+    const juce::int64 maximumSamples = (juce::int64) (reader->sampleRate * 60.0);
+    const int samplesToRead = (int) juce::jmin (reader->lengthInSamples, maximumSamples);
+
+    if (samplesToRead < 4096)
+    {
+        errorMessage = "The reference recording is too short.";
+        return std::nullopt;
+    }
+
+    const int sourceChannels = juce::jmax (1, (int) reader->numChannels);
+    juce::AudioBuffer<float> source (sourceChannels, samplesToRead);
+    reader->read (&source, 0, samplesToRead, 0, true, true);
+
+    juce::AudioBuffer<float> mono (1, samplesToRead);
+    mono.clear();
+
+    for (int ch = 0; ch < source.getNumChannels(); ++ch)
+        mono.addFrom (0, 0, source, ch, 0, samplesToRead, 1.0f / (float) source.getNumChannels());
+
+    constexpr int fftOrder = 11;
+    constexpr int fftSize = 1 << fftOrder;
+    constexpr int hop = fftSize / 2;
+
+    juce::dsp::FFT fft (fftOrder);
+    juce::dsp::WindowingFunction<float> window ((size_t) fftSize, juce::dsp::WindowingFunction<float>::hann, true);
+    std::vector<float> data ((size_t) fftSize * 2, 0.0f);
+    std::array<double, VoiceProfile::bandCount> energies {};
+    std::vector<float> pitches;
+    int frameCount = 0;
+
+    const float* samples = mono.getReadPointer (0);
+
+    for (int start = 0; start + fftSize < samplesToRead; start += hop)
+    {
+        const float rms = mono.getRMSLevel (0, start, fftSize);
+        if (rms < 0.002f)
+            continue;
+
+        std::fill (data.begin(), data.end(), 0.0f);
+        std::copy (samples + start, samples + start + fftSize, data.begin());
+        window.multiplyWithWindowingTable (data.data(), fftSize);
+        fft.performFrequencyOnlyForwardTransform (data.data());
+
+        for (int band = 0; band < VoiceProfile::bandCount; ++band)
+        {
+            const int lo = juce::jlimit (1, fftSize / 2 - 1,
+                (int) std::floor (bandEdges[(size_t) band] * fftSize / reader->sampleRate));
+            const int hi = juce::jlimit (lo + 1, fftSize / 2,
+                (int) std::ceil (bandEdges[(size_t) band + 1] * fftSize / reader->sampleRate));
+
+            double energy = 0.0;
+            for (int bin = lo; bin < hi; ++bin)
+                energy += (double) data[(size_t) bin] * (double) data[(size_t) bin];
+
+            energies[(size_t) band] += energy / (double) juce::jmax (1, hi - lo);
+        }
+
+        int positiveCrossings = 0;
+        float previous = samples[start];
+
+        for (int n = start + 1; n < start + fftSize; ++n)
+        {
+            const float current = samples[n];
+            if (previous <= 0.0f && current > 0.0f)
+                ++positiveCrossings;
+            previous = current;
+        }
+
+        const float roughPitch = (float) positiveCrossings * (float) reader->sampleRate / (float) fftSize;
+        if (roughPitch >= 55.0f && roughPitch <= 700.0f)
+            pitches.push_back (roughPitch);
+
+        ++frameCount;
+    }
+
+    if (frameCount == 0)
+    {
+        errorMessage = "No usable vocal frames were detected in the reference.";
+        return std::nullopt;
+    }
+
+    VoiceProfile profile;
+    profile.name = file.getFileNameWithoutExtension();
+    profile.sourcePath = file.getFullPathName();
+
+    std::array<float, VoiceProfile::bandCount> db {};
+    float meanDb = 0.0f;
+
+    for (int i = 0; i < VoiceProfile::bandCount; ++i)
+    {
+        const double avg = energies[(size_t) i] / (double) frameCount;
+        db[(size_t) i] = (float) (10.0 * std::log10 (avg + 1.0e-12));
+        meanDb += db[(size_t) i];
+    }
+
+    meanDb /= (float) VoiceProfile::bandCount;
+
+    for (int i = 0; i < VoiceProfile::bandCount; ++i)
+        profile.bandDb[(size_t) i] = juce::jlimit (-12.0f, 12.0f, (db[(size_t) i] - meanDb) * 0.72f);
+
+    if (! pitches.empty())
+    {
+        std::sort (pitches.begin(), pitches.end());
+        profile.pitchLowHz = pitches[(size_t) ((pitches.size() - 1) * 0.10)];
+        profile.pitchHighHz = pitches[(size_t) ((pitches.size() - 1) * 0.90)];
+    }
+
+    const juce::int64 hash = file.getFullPathName().hashCode64();
+    const float hue = (float) ((juce::uint64) hash % 1000) / 1000.0f;
+    profile.colour = juce::Colour::fromHSV (hue, 0.62f, 0.92f, 1.0f);
+    profile.hexCode = colourToHex (profile.colour);
+
+    float low = 0.0f;
+    float high = 0.0f;
+    for (int i = 0; i < 4; ++i) low += profile.bandDb[(size_t) i];
+    for (int i = 6; i < VoiceProfile::bandCount; ++i) high += profile.bandDb[(size_t) i];
+    low *= 0.25f;
+    high *= 0.25f;
+
+    const float jitterX = ((float) (((juce::uint64) hash >> 12) & 255) / 255.0f - 0.5f) * 0.12f;
+    const float jitterY = ((float) (((juce::uint64) hash >> 20) & 255) / 255.0f - 0.5f) * 0.12f;
+
+    profile.position = {
+        juce::jlimit (0.08f, 0.92f, 0.50f + high / 28.0f + jitterX),
+        juce::jlimit (0.08f, 0.92f, 0.50f - low / 28.0f + jitterY)
+    };
+
+    return profile;
 }
-void MorphProcessor::togglePreview()
+
+bool MorphProcessor::addVoiceFromFile (const juce::File& file, juce::String& errorMessage)
 {
-    if(busy || armed || !hasAudio())return;
-    const juce::SpinLock::ScopedLockType lock(audioLock);previewSample=0;preview=!preview.load();
-}
-std::array<float,256> MorphProcessor::waveform() const
-{
-    std::array<float,256> peaks{};
-    const juce::SpinLock::ScopedTryLockType lock(audioLock);if(!lock.isLocked())return peaks;
-    const int n=recordedSamples.load();
-    for(int i=0;i<256 && n>0;++i)
-        for(int j=0;j<8;++j){const int at=juce::jmin(n-1,(int)((juce::int64)n*(i*8+j)/(256*8)));peaks[(size_t)i]=juce::jmax(peaks[(size_t)i],std::abs(captured.getSample(0,at)));}
-    return peaks;
-}
-bool MorphProcessor::writeWave(const juce::File& file,const juce::AudioBuffer<float>& audio,int count,double rate) const
-{
-    if(!file.getParentDirectory().createDirectory())return false;
-    auto stream=file.createOutputStream();if(!stream)return false;
-    stream->setPosition(0);stream->truncate();juce::WavAudioFormat format;
-    std::unique_ptr<juce::AudioFormatWriter> writer(format.createWriterFor(stream.release(),rate,1,24,{},0));
-    return writer && writer->writeFromAudioSampleBuffer(audio,0,count);
-}
-bool MorphProcessor::readWave(const juce::File& file,juce::AudioBuffer<float>& out,double rate,int maximum) const
-{
-    juce::AudioFormatManager formats;formats.registerBasicFormats();
-    std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(file));
-    if(!reader || reader->sampleRate<8000 || reader->sampleRate>192000 || reader->numChannels<1 || reader->numChannels>2 || reader->lengthInSamples<1 || reader->lengthInSamples/reader->sampleRate>180)return false;
-    const int count=(int)std::llround(reader->lengthInSamples*rate/reader->sampleRate);
-    if(count>maximum || count<1)return false;
-    juce::AudioBuffer<float> original((int)reader->numChannels,(int)reader->lengthInSamples+8);original.clear();
-    if(!reader->read(&original,0,(int)reader->lengthInSamples,0,true,true))return false;
-    if(original.getNumChannels()==2)for(int i=0;i<(int)reader->lengthInSamples;++i)original.setSample(0,i,.5f*(original.getSample(0,i)+original.getSample(1,i)));
-    out.setSize(1,count);
-    juce::LagrangeInterpolator resampler;resampler.process(reader->sampleRate/rate,original.getReadPointer(0),out.getWritePointer(0),count);
-    for(int i=0;i<count;++i)if(!std::isfinite(out.getSample(0,i)))return false;
+    auto analysed = analyseVoiceFile (file, errorMessage);
+
+    if (! analysed.has_value())
+        return false;
+
+    const juce::ScopedLock lock (profilesLock);
+
+    if (profiles.size() >= 16)
+    {
+        errorMessage = "This build supports up to 16 simultaneous target voices.";
+        return false;
+    }
+
+    profiles.push_back (*analysed);
     return true;
 }
-bool MorphProcessor::importAudio(const juce::File& file)
+
+void MorphProcessor::addGeneratedVoice (juce::String hexCode, float voiceSpace, float tone, juce::String customName)
 {
-    if(busy)return false;
-    juce::AudioBuffer<float> temp;
-    if(!readWave(file,temp,sampleRate.load(),captured.getNumSamples())){message("Use a mono/stereo audio file up to 3 minutes.");return false;}
-    {const juce::SpinLock::ScopedLockType lock(audioLock);armed=false;preview=false;resultReady=false;captured.copyFrom(0,0,temp,0,0,temp.getNumSamples());recordedSamples=temp.getNumSamples();originSample=lastHostSample.load();}
-    message("Audio imported. Its start is aligned to the current DAW position.");return true;
-}
-juce::File MorphProcessor::resourceRoot() const
-{
-    const auto env=juce::SystemStats::getEnvironmentVariable("METAMORPH_RESOURCES",{});
-    if(env.isNotEmpty())return juce::File(env);
-    {const juce::ScopedLock lock(textLock);if(resourcesOverride.isDirectory())return resourcesOverride;}
-    return juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory().getParentDirectory().getChildFile("Resources");
-}
-void MorphProcessor::setResources(const juce::File& folder)
-{
-    if(busy)return;
-    {const juce::ScopedLock lock(textLock);resourcesOverride=folder;}
-    message("Runtime folder selected.");
-}
-bool MorphProcessor::transform()
-{
-    if(busy || isThreadRunning())return false;
-    if(!hasAudio()){message("Record or import audio first.");return false;}
-    {const juce::ScopedLock lock(textLock);if(!modelFile.existsAsFile()){statusText="Choose a voice .pth file first.";return false;}}
-    armed=false;preview=false;busy=true;progress=.01f;
-    jobPitch=parameters.getRawParameterValue("pitch")->load();message("Starting voice engine...");
-    startThread();return true;
-}
-void MorphProcessor::cancelTransform(){signalThreadShouldExit();message("Cancelling transformation...");}
-void MorphProcessor::run()
-{
-    struct Finish {std::atomic<bool>& b;~Finish(){b=false;}} finish{busy};
-    const auto resources=resourceRoot();
-    const auto customPython=juce::SystemStats::getEnvironmentVariable("METAMORPH_PYTHON",{});
-    const auto python=customPython.isNotEmpty()?juce::File(customPython):resources.getChildFile("runtime/python.exe");
-    const auto script=resources.getChildFile("worker/run.py");
-    if(!python.existsAsFile() || !script.existsAsFile()){message("Runtime missing. Install the full VST3 folder or select its Resources folder.");return;}
-    const auto job=sessionFolder.getChildFile(juce::Uuid().toString());
-    if(!job.createDirectory()){message("Cannot create an audio cache folder.");return;}
-    const auto input=job.getChildFile("input.wav"),output=job.getChildFile("output.wav"),request=job.getChildFile("request.json"),statusFile=job.getChildFile("status.json");
-    juce::AudioBuffer<float> source;
-    double rate=sampleRate.load();
-    {const juce::SpinLock::ScopedLockType lock(audioLock);source.setSize(1,recordedSamples.load());source.copyFrom(0,0,captured,0,0,source.getNumSamples());}
-    if(!writeWave(input,source,source.getNumSamples(),rate)){message("Unable to save the recording for conversion.");return;}
-    auto* object=new juce::DynamicObject();juce::var settings(object);
-    object->setProperty("input",input.getFullPathName());object->setProperty("output",output.getFullPathName());object->setProperty("resources",resources.getFullPathName());object->setProperty("pitch",jobPitch);
-    {const juce::ScopedLock lock(textLock);object->setProperty("model",modelFile.getFullPathName());}
-    if(!request.replaceWithText(juce::JSON::toString(settings))){message("Unable to create the conversion request.");return;}
-    juce::ChildProcess worker;
-    if(!worker.start(juce::StringArray{python.getFullPathName(),"-B",script.getFullPathName(),request.getFullPathName()},juce::ChildProcess::wantStdOut|juce::ChildProcess::wantStdErr)){message("The voice engine could not start.");return;}
-    const auto started=juce::Time::getMillisecondCounterHiRes();
-    while(worker.isRunning())
+    const auto colour = colourFromHex (hexCode);
+    juce::Random random ((juce::int64) hexCode.hashCode64()
+                         ^ ((juce::int64) (voiceSpace * 1000.0f) << 12)
+                         ^ (juce::int64) (tone * 1000.0f));
+
+    VoiceProfile p;
+    p.generated = true;
+    p.colour = colour;
+    p.hexCode = colourToHex (colour);
+    p.name = customName.isNotEmpty() ? customName : "Generated " + p.hexCode;
+    p.position = {
+        juce::jlimit (0.08f, 0.92f, voiceSpace),
+        juce::jlimit (0.08f, 0.92f, 1.0f - tone)
+    };
+    p.pitchLowHz = juce::jmap (voiceSpace, 0.0f, 1.0f, 80.0f, 145.0f);
+    p.pitchHighHz = juce::jmap (voiceSpace, 0.0f, 1.0f, 210.0f, 410.0f);
+
+    for (int i = 0; i < VoiceProfile::bandCount; ++i)
     {
-        if(threadShouldExit() || juce::Time::getMillisecondCounterHiRes()-started>30*60*1000)
-        {worker.kill();worker.waitForProcessToFinish(2000);message("Transformation cancelled or timed out.");return;}
-        const auto state=juce::JSON::parse(statusFile);
-        if(auto* obj=state.getDynamicObject()){progress=(float)obj->getProperty("progress");message(obj->getProperty("message").toString());}
-        wait(150);
+        const float spectralTilt = juce::jmap (voiceSpace, 0.0f, 1.0f, -1.0f, 1.0f)
+                                 * juce::jmap ((float) i, 0.0f, 9.0f, -4.0f, 4.0f);
+        const float toneCurve = std::sin ((float) i * 0.78f
+                                        + tone * juce::MathConstants<float>::twoPi) * 2.8f;
+        const float randomShape = (random.nextFloat() - 0.5f) * 4.5f;
+        p.bandDb[(size_t) i] = juce::jlimit (-10.0f, 10.0f, spectralTilt + toneCurve + randomShape);
     }
-    const auto logs=worker.readAllProcessOutput();job.getChildFile("worker.log").replaceWithText(logs);
-    const auto state=juce::JSON::parse(statusFile);
-    if(worker.getExitCode()!=0 || state.getProperty("state",{}).toString()!="done")
-    {message(state.getProperty("message","Voice engine failed. See the session's worker.log.").toString());return;}
-    juce::AudioBuffer<float> result;
-    if(!readWave(output,result,rate,source.getNumSamples()) || result.getNumSamples()!=source.getNumSamples())
-    {message("The voice engine returned an invalid audio length.");return;}
-    if(sampleRate.load()!=rate || recordedSamples.load()!=source.getNumSamples())
-    {message("Audio settings changed during conversion. Please transform again.");return;}
-    {const juce::SpinLock::ScopedLockType lock(audioLock);transformed=std::move(result);resultReady=true;}
-    progress=1;message("Ready. Replay the recorded section in your DAW, or click Preview.");
+
+    const juce::ScopedLock lock (profilesLock);
+    if (profiles.size() < 16)
+        profiles.push_back (p);
 }
-bool MorphProcessor::exportAudio(const juce::File& file)
+
+void MorphProcessor::addSyntheticPreset (int presetIndex)
 {
-    if(busy || !hasAudio())return false;
-    juce::AudioBuffer<float> audio;
-    {const juce::SpinLock::ScopedLockType lock(audioLock);const int n=recordedSamples.load();audio.setSize(1,n);const float mix=parameters.getRawParameterValue("mix")->load();
-     for(int i=0;i<n;++i){const float dry=captured.getSample(0,i);audio.setSample(0,i,resultReady?dry*(1-mix)+transformed.getSample(0,i)*mix:dry);}}
-    const bool ok=writeWave(file,audio,audio.getNumSamples(),sampleRate.load());message(ok?"WAV exported.":"Unable to write this WAV file.");return ok;
+    presetIndex = juce::jlimit (0, 39, presetIndex);
+    const float hue = (float) presetIndex / 40.0f;
+    const auto colour = juce::Colour::fromHSV (hue, 0.68f, 0.92f, 1.0f);
+    const float voiceSpace = 0.12f + 0.76f * ((float) ((presetIndex * 17) % 41) / 40.0f);
+    const float tone = 0.10f + 0.80f * ((float) ((presetIndex * 29 + 7) % 41) / 40.0f);
+
+    addGeneratedVoice (colourToHex (colour), voiceSpace, tone,
+                       "Synthetic " + juce::String (presetIndex + 1).paddedLeft ('0', 2));
 }
-void MorphProcessor::getStateInformation(juce::MemoryBlock& destination)
+
+void MorphProcessor::removeVoice (int index)
 {
-    auto tree=parameters.copyState();
-    {const juce::ScopedLock lock(textLock);tree.setProperty("model",modelFile.getFullPathName(),nullptr);tree.setProperty("resources",resourcesOverride.getFullPathName(),nullptr);}
-    // Session audio is intentionally exported explicitly; preset state never embeds large recordings.
-    if(auto xml=tree.createXml())copyXmlToBinary(*xml,destination);
+    const juce::ScopedLock lock (profilesLock);
+    if (juce::isPositiveAndBelow (index, (int) profiles.size()))
+        profiles.erase (profiles.begin() + index);
 }
-void MorphProcessor::setStateInformation(const void* data,int size)
+
+void MorphProcessor::clearVoices()
 {
-    if(auto xml=getXmlFromBinary(data,size))if(xml->hasTagName(parameters.state.getType()))
-    {auto tree=juce::ValueTree::fromXml(*xml);parameters.replaceState(tree);const juce::ScopedLock lock(textLock);modelFile=juce::File(tree.getProperty("model").toString());resourcesOverride=juce::File(tree.getProperty("resources").toString());}
+    const juce::ScopedLock lock (profilesLock);
+    profiles.clear();
 }
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new MorphProcessor();}
+
+std::vector<VoiceProfile> MorphProcessor::getProfilesSnapshot() const
+{
+    const juce::ScopedLock lock (profilesLock);
+    return profiles;
+}
+
+void MorphProcessor::applyParameterValue (const juce::String& id, float plainValue)
+{
+    if (auto* p = parameters.getParameter (id))
+        p->setValueNotifyingHost (p->convertTo0to1 (plainValue));
+}
+
+void MorphProcessor::setMorphPointFromUI (float x, float y)
+{
+    midiMorphOverride.store (false);
+    applyParameterValue ("morphX", juce::jlimit (0.0f, 1.0f, x));
+    applyParameterValue ("morphY", juce::jlimit (0.0f, 1.0f, y));
+}
+
+void MorphProcessor::setInfluenceFromUI (float radius)
+{
+    midiMorphOverride.store (false);
+    applyParameterValue ("radius", juce::jlimit (0.08f, 0.75f, radius));
+}
+
+void MorphProcessor::addWaypointFromCurrent()
+{
+    const int count = waypointCount.load();
+    if (count >= 8)
+        return;
+
+    waypointX[(size_t) count].store (parameters.getRawParameterValue ("morphX")->load());
+    waypointY[(size_t) count].store (parameters.getRawParameterValue ("morphY")->load());
+    waypointCount.store (count + 1);
+    activeWaypoint.store (count);
+}
+
+void MorphProcessor::clearWaypoints()
+{
+    waypointCount.store (0);
+    activeWaypoint.store (-1);
+}
+
+juce::Point<float> MorphProcessor::getWaypoint (int index) const
+{
+    if (! juce::isPositiveAndBelow (index, waypointCount.load()))
+        return { 0.5f, 0.5f };
+
+    return { waypointX[(size_t) index].load(), waypointY[(size_t) index].load() };
+}
+
+void MorphProcessor::activateWaypoint (int index)
+{
+    if (! juce::isPositiveAndBelow (index, waypointCount.load()))
+        return;
+
+    const auto p = getWaypoint (index);
+    setMorphPointFromUI (p.x, p.y);
+    activeWaypoint.store (index);
+}
+
+void MorphProcessor::activateNextWaypoint()
+{
+    const int count = waypointCount.load();
+    if (count == 0)
+        return;
+
+    activateWaypoint ((activeWaypoint.load() + 1 + count) % count);
+}
+
+void MorphProcessor::activatePreviousWaypoint()
+{
+    const int count = waypointCount.load();
+    if (count == 0)
+        return;
+
+    int index = activeWaypoint.load() - 1;
+    if (index < 0)
+        index = count - 1;
+
+    activateWaypoint (index);
+}
+
+void MorphProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    auto state = parameters.copyState();
+
+    juce::ValueTree voicesTree { "VOICES" };
+    {
+        const juce::ScopedLock lock (profilesLock);
+        for (const auto& profile : profiles)
+            voicesTree.addChild (profile.toValueTree(), -1, nullptr);
+    }
+    state.addChild (voicesTree, -1, nullptr);
+
+    juce::ValueTree waypointsTree { "WAYPOINTS" };
+    for (int i = 0; i < waypointCount.load(); ++i)
+    {
+        juce::ValueTree point { "POINT" };
+        point.setProperty ("x", waypointX[(size_t) i].load(), nullptr);
+        point.setProperty ("y", waypointY[(size_t) i].load(), nullptr);
+        waypointsTree.addChild (point, -1, nullptr);
+    }
+    waypointsTree.setProperty ("active", activeWaypoint.load(), nullptr);
+    state.addChild (waypointsTree, -1, nullptr);
+
+    if (auto xml = state.createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void MorphProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    auto xml = getXmlFromBinary (data, sizeInBytes);
+    if (xml == nullptr)
+        return;
+
+    auto tree = juce::ValueTree::fromXml (*xml);
+    if (! tree.isValid())
+        return;
+
+    auto voicesTree = tree.getChildWithName ("VOICES");
+    auto waypointsTree = tree.getChildWithName ("WAYPOINTS");
+
+    if (voicesTree.isValid())
+        tree.removeChild (voicesTree, nullptr);
+    if (waypointsTree.isValid())
+        tree.removeChild (waypointsTree, nullptr);
+
+    parameters.replaceState (tree);
+
+    if (voicesTree.isValid())
+    {
+        const juce::ScopedLock lock (profilesLock);
+        profiles.clear();
+
+        for (int i = 0; i < voicesTree.getNumChildren(); ++i)
+            if (auto profile = VoiceProfile::fromValueTree (voicesTree.getChild (i)); profile.has_value())
+                profiles.push_back (*profile);
+    }
+
+    waypointCount.store (0);
+
+    if (waypointsTree.isValid())
+    {
+        const int count = juce::jmin (8, waypointsTree.getNumChildren());
+
+        for (int i = 0; i < count; ++i)
+        {
+            const auto point = waypointsTree.getChild (i);
+            waypointX[(size_t) i].store ((float) point.getProperty ("x", 0.5));
+            waypointY[(size_t) i].store ((float) point.getProperty ("y", 0.5));
+        }
+
+        waypointCount.store (count);
+        activeWaypoint.store ((int) waypointsTree.getProperty ("active", -1));
+    }
+}
+
+juce::AudioProcessorEditor* MorphProcessor::createEditor()
+{
+    return new MorphEditor (*this);
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new MorphProcessor();
+}
