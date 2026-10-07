@@ -1,93 +1,660 @@
 #include "Editor.h"
 
-namespace { const juce::Colour mint{0xff83edcf}, ink{0xff0c1118},muted{0xff81929f}; }
-MorphEditor::MorphEditor(MorphProcessor& p):AudioProcessorEditor(p),processor(p)
+namespace
 {
-    look.setColour(juce::TextButton::buttonColourId,juce::Colour(0xff22313c));
-    look.setColour(juce::TextButton::textColourOffId,juce::Colour(0xffedf6f6));
-    look.setColour(juce::Slider::thumbColourId,mint);
-    look.setColour(juce::Slider::rotarySliderFillColourId,mint);
-    look.setColour(juce::Slider::trackColourId,mint);
-    look.setColour(juce::Slider::textBoxOutlineColourId,juce::Colours::transparentBlack);
-    setLookAndFeel(&look);
-    for(auto* b:{&model,&import,&record,&transform,&reset,&preview,&save,&settings})addAndMakeVisible(b);
-    for(auto* c:std::initializer_list<juce::Component*>{&bypass,&mix,&pitch,&statusLabel,&modelLabel})addAndMakeVisible(c);
-    mix.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);mix.setTextBoxStyle(juce::Slider::TextBoxBelow,false,90,24);
-    mix.textFromValueFunction=[](double v){return juce::String((int)std::round(v*100))+"%";};
-    mix.valueFromTextFunction=[](const juce::String& s){return s.getDoubleValue()/100;};
-    pitch.setSliderStyle(juce::Slider::LinearHorizontal);pitch.setTextBoxStyle(juce::Slider::TextBoxRight,false,80,24);
-    pitch.setTextValueSuffix(" st");
-    mixAttachment=std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.parameters,"mix",mix);
-    pitchAttachment=std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(p.parameters,"pitch",pitch);
-    bypassAttachment=std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(p.parameters,"bypass",bypass);
-    transform.setColour(juce::TextButton::buttonColourId,mint);transform.setColour(juce::TextButton::textColourOffId,ink);
-    statusLabel.setColour(juce::Label::textColourId,juce::Colour(0xffb6c6cf));statusLabel.setJustificationType(juce::Justification::centred);statusLabel.setFont(14.0f);
-    modelLabel.setJustificationType(juce::Justification::centred);modelLabel.setFont(19.0f);
-    model.onClick=[this]{choose(0);};import.onClick=[this]{choose(1);};save.onClick=[this]{choose(2);};settings.onClick=[this]{choose(3);};
-    record.onClick=[this]{if(processor.isArmed())processor.stopRecord();else processor.armRecord();};
-    transform.onClick=[this]{if(processor.isBusy())processor.cancelTransform();else processor.transform();};
-    reset.onClick=[this]{processor.resetAudio();};preview.onClick=[this]{processor.togglePreview();};
-    setSize(720,820);startTimerHz(12);timerCallback();
+constexpr auto panelColour = 0xff171b24;
+constexpr auto canvasColour = 0xff10131a;
+constexpr auto accentColour = 0xff78e7dc;
+constexpr auto textColour = 0xffe8edf5;
+constexpr auto mutedColour = 0xff7f8998;
+
+juce::Rectangle<float> canvasInnerBounds (const juce::Component& c)
+{
+    return c.getLocalBounds().toFloat().reduced (22.0f);
 }
-MorphEditor::~MorphEditor(){stopTimer();setLookAndFeel(nullptr);}
+}
+
+juce::Point<float> MorphCanvas::toNormalised (juce::Point<float> p) const
+{
+    const auto b = canvasInnerBounds (*this);
+
+    return {
+        juce::jlimit (0.0f, 1.0f, (p.x - b.getX()) / juce::jmax (1.0f, b.getWidth())),
+        juce::jlimit (0.0f, 1.0f, (p.y - b.getY()) / juce::jmax (1.0f, b.getHeight()))
+    };
+}
+
+juce::Point<float> MorphCanvas::fromNormalised (juce::Point<float> p) const
+{
+    const auto b = canvasInnerBounds (*this);
+    return { b.getX() + p.x * b.getWidth(), b.getY() + p.y * b.getHeight() };
+}
+
+void MorphCanvas::paint (juce::Graphics& g)
+{
+    g.fillAll (juce::Colour (canvasColour));
+    const auto bounds = canvasInnerBounds (*this);
+
+    juce::ColourGradient gradient (
+        juce::Colour (0xff1c2330), bounds.getTopLeft(),
+        juce::Colour (0xff0e1117), bounds.getBottomRight(), false);
+
+    g.setGradientFill (gradient);
+    g.fillRoundedRectangle (bounds, 18.0f);
+
+    g.setColour (juce::Colours::white.withAlpha (0.035f));
+    for (int i = 1; i < 10; ++i)
+    {
+        const float x = bounds.getX() + bounds.getWidth() * (float) i / 10.0f;
+        const float y = bounds.getY() + bounds.getHeight() * (float) i / 10.0f;
+        g.drawVerticalLine ((int) x, bounds.getY(), bounds.getBottom());
+        g.drawHorizontalLine ((int) y, bounds.getX(), bounds.getRight());
+    }
+
+    const auto profiles = processor.getProfilesSnapshot();
+    const juce::Point<float> cursorNorm {
+        processor.parameters.getRawParameterValue ("morphX")->load(),
+        processor.parameters.getRawParameterValue ("morphY")->load()
+    };
+
+    const auto cursor = fromNormalised (cursorNorm);
+    const float radiusNorm = processor.parameters.getRawParameterValue ("radius")->load();
+    const float radiusPx = radiusNorm * juce::jmin (bounds.getWidth(), bounds.getHeight());
+
+    for (const auto& profile : profiles)
+    {
+        const auto centre = fromNormalised (profile.position);
+        const float distance = centre.getDistanceFrom (cursor);
+        const float influence = juce::jlimit (0.0f, 1.0f, 1.0f - distance / juce::jmax (1.0f, radiusPx));
+
+        if (distance < radiusPx * 2.15f)
+        {
+            g.setColour (profile.colour.withAlpha (0.12f + influence * 0.35f));
+            g.drawLine (juce::Line<float> (centre, cursor), 1.0f + influence * 4.0f);
+        }
+
+        juce::Path curve;
+        for (int i = 0; i < VoiceProfile::bandCount; ++i)
+        {
+            const float angle = juce::MathConstants<float>::twoPi * (float) i / (float) VoiceProfile::bandCount;
+            const float radial = 13.0f + std::abs (profile.bandDb[(size_t) i]) * 0.7f;
+            const auto point = centre + juce::Point<float> (
+                std::cos (angle) * radial,
+                std::sin (angle) * radial * 0.55f);
+
+            if (i == 0)
+                curve.startNewSubPath (point);
+            else
+                curve.lineTo (point);
+        }
+
+        curve.closeSubPath();
+
+        g.setColour (profile.colour.withAlpha (0.16f + influence * 0.18f));
+        g.fillPath (curve);
+        g.setColour (profile.colour.withAlpha (0.78f));
+        g.strokePath (curve, juce::PathStrokeType (1.7f));
+
+        for (int i = 0; i < VoiceProfile::bandCount; i += 2)
+        {
+            const float angle = juce::MathConstants<float>::twoPi * (float) i / (float) VoiceProfile::bandCount;
+            const float radial = 13.0f + std::abs (profile.bandDb[(size_t) i]) * 0.7f;
+            const auto point = centre + juce::Point<float> (
+                std::cos (angle) * radial,
+                std::sin (angle) * radial * 0.55f);
+
+            g.fillEllipse (juce::Rectangle<float> (4.0f, 4.0f).withCentre (point));
+        }
+
+        g.setColour (juce::Colour (textColour));
+        g.setFont (12.5f);
+        g.drawText (
+            profile.name,
+            juce::Rectangle<float> (centre.x - 70.0f, centre.y + 22.0f, 140.0f, 18.0f),
+            juce::Justification::centred,
+            true);
+
+        const auto pitchText =
+            juce::String ((int) std::round (profile.pitchLowHz))
+            + "-"
+            + juce::String ((int) std::round (profile.pitchHighHz))
+            + " Hz";
+
+        g.setColour (juce::Colour (mutedColour));
+        g.setFont (10.5f);
+        g.drawText (
+            pitchText,
+            juce::Rectangle<float> (centre.x - 55.0f, centre.y + 38.0f, 110.0f, 15.0f),
+            juce::Justification::centred,
+            false);
+    }
+
+    for (int i = 0; i < processor.getWaypointCount(); ++i)
+    {
+        const auto p = fromNormalised (processor.getWaypoint (i));
+        const bool active = i == processor.getActiveWaypoint();
+
+        g.setColour (active
+            ? juce::Colour (accentColour)
+            : juce::Colours::white.withAlpha (0.35f));
+
+        juce::Path diamond;
+        diamond.startNewSubPath (p.x, p.y - 7.0f);
+        diamond.lineTo (p.x + 7.0f, p.y);
+        diamond.lineTo (p.x, p.y + 7.0f);
+        diamond.lineTo (p.x - 7.0f, p.y);
+        diamond.closeSubPath();
+        g.fillPath (diamond);
+
+        g.drawText (
+            juce::String (i + 1),
+            (int) p.x - 9,
+            (int) p.y + 9,
+            18,
+            14,
+            juce::Justification::centred,
+            false);
+    }
+
+    g.setColour (juce::Colour (accentColour).withAlpha (0.09f));
+    g.fillEllipse (juce::Rectangle<float> (radiusPx * 2.0f, radiusPx * 2.0f).withCentre (cursor));
+
+    g.setColour (juce::Colour (accentColour).withAlpha (0.75f));
+    g.drawEllipse (juce::Rectangle<float> (radiusPx * 2.0f, radiusPx * 2.0f).withCentre (cursor), 1.5f);
+
+    g.setColour (juce::Colours::white);
+    g.fillEllipse (juce::Rectangle<float> (13.0f, 13.0f).withCentre (cursor));
+
+    g.setColour (juce::Colour (accentColour));
+    g.drawEllipse (juce::Rectangle<float> (24.0f, 24.0f).withCentre (cursor), 2.2f);
+
+    if (profiles.empty())
+    {
+        g.setColour (juce::Colours::white.withAlpha (0.65f));
+        g.setFont (17.0f);
+        g.drawFittedText (
+            "Drop a clean vocal reference here\nor choose IMPORT VOICE",
+            bounds.toNearestInt().reduced (100),
+            juce::Justification::centred,
+            2);
+    }
+
+    if (draggingFile)
+    {
+        g.setColour (juce::Colour (accentColour).withAlpha (0.10f));
+        g.fillRoundedRectangle (bounds, 18.0f);
+        g.setColour (juce::Colour (accentColour));
+        g.drawRoundedRectangle (bounds, 18.0f, 2.0f);
+    }
+}
+
+void MorphCanvas::updateCursorFromMouse (juce::Point<float> p)
+{
+    const auto n = toNormalised (p);
+    processor.setMorphPointFromUI (n.x, n.y);
+    repaint();
+}
+
+void MorphCanvas::mouseDown (const juce::MouseEvent& e)
+{
+    updateCursorFromMouse (e.position);
+}
+
+void MorphCanvas::mouseDrag (const juce::MouseEvent& e)
+{
+    updateCursorFromMouse (e.position);
+}
+
+void MorphCanvas::mouseWheelMove (
+    const juce::MouseEvent&,
+    const juce::MouseWheelDetails& wheel)
+{
+    const float current = processor.parameters.getRawParameterValue ("radius")->load();
+    processor.setInfluenceFromUI (current + wheel.deltaY * 0.08f);
+    repaint();
+}
+
+bool MorphCanvas::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    for (const auto& path : files)
+    {
+        const auto ext = juce::File (path).getFileExtension().toLowerCase();
+
+        if (ext == ".wav" || ext == ".aif" || ext == ".aiff" || ext == ".flac")
+        {
+            draggingFile = true;
+            repaint();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void MorphCanvas::fileDragExit (const juce::StringArray&)
+{
+    draggingFile = false;
+    repaint();
+}
+
+void MorphCanvas::filesDropped (const juce::StringArray& files, int, int)
+{
+    draggingFile = false;
+
+    for (const auto& path : files)
+    {
+        juce::String error;
+
+        if (! processor.addVoiceFromFile (juce::File (path), error))
+        {
+            if (onStatus)
+                onStatus (error);
+        }
+        else if (onStatus)
+        {
+            onStatus ("Imported " + juce::File (path).getFileName());
+        }
+    }
+
+    repaint();
+}
+
+MorphEditor::MorphEditor (MorphProcessor& p)
+    : AudioProcessorEditor (&p),
+      processor (p),
+      morphCanvas (p)
+{
+    setSize (1120, 720);
+    setResizable (true, true);
+    setResizeLimits (900, 600, 1500, 1000);
+
+    titleLabel.setText ("METAMORPH CR", juce::dontSendNotification);
+    titleLabel.setFont (juce::Font (juce::FontOptions (22.0f, juce::Font::bold)));
+    titleLabel.setColour (juce::Label::textColourId, juce::Colour (textColour));
+    addAndMakeVisible (titleLabel);
+
+    subtitleLabel.setText ("real-time reference timbre morphing", juce::dontSendNotification);
+    subtitleLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
+    subtitleLabel.setColour (juce::Label::textColourId, juce::Colour (mutedColour));
+    addAndMakeVisible (subtitleLabel);
+
+    statusLabel.setText ("Ready", juce::dontSendNotification);
+    statusLabel.setColour (juce::Label::textColourId, juce::Colour (mutedColour));
+    statusLabel.setJustificationType (juce::Justification::centredLeft);
+    addAndMakeVisible (statusLabel);
+
+    latencyLabel.setColour (juce::Label::textColourId, juce::Colour (mutedColour));
+    latencyLabel.setJustificationType (juce::Justification::centredRight);
+    addAndMakeVisible (latencyLabel);
+
+    morphCanvas.onStatus = [this] (const juce::String& s)
+    {
+        showStatus (s);
+        updateVoiceList();
+    };
+    addAndMakeVisible (morphCanvas);
+
+    configureSlider (preGainSlider, " dB");
+    configureSlider (pitchSlider, " st");
+    configureSlider (outputSlider, " dB");
+    configureSlider (mixSlider, " %");
+    configureSlider (radiusSlider);
+    configureSlider (voiceSpaceSlider);
+    configureSlider (toneSlider);
+
+    preGainSlider.setRange (-24.0, 24.0, 0.1);
+    pitchSlider.setRange (-12.0, 12.0, 0.01);
+    outputSlider.setRange (-24.0, 24.0, 0.1);
+    mixSlider.setRange (0.0, 100.0, 0.1);
+    radiusSlider.setRange (0.08, 0.75, 0.001);
+    voiceSpaceSlider.setRange (0.0, 1.0, 0.001);
+    toneSlider.setRange (0.0, 1.0, 0.001);
+    voiceSpaceSlider.setValue (0.5);
+    toneSlider.setValue (0.5);
+
+    for (auto* slider : {
+        &preGainSlider,
+        &pitchSlider,
+        &outputSlider,
+        &mixSlider,
+        &radiusSlider,
+        &voiceSpaceSlider,
+        &toneSlider
+    })
+    {
+        addAndMakeVisible (*slider);
+    }
+
+    realtimeButton.setColour (juce::ToggleButton::textColourId, juce::Colour (textColour));
+    bypassButton.setColour (juce::ToggleButton::textColourId, juce::Colour (textColour));
+    addAndMakeVisible (realtimeButton);
+    addAndMakeVisible (bypassButton);
+
+    qualityBox.addItemList (
+        { "Lowest Latency", "Lower Latency", "Higher Quality", "Highest Quality" },
+        1);
+
+    inputModeBox.addItemList (
+        { "Stereo / Auto", "Left only", "Right only" },
+        1);
+
+    addAndMakeVisible (qualityBox);
+    addAndMakeVisible (inputModeBox);
+
+    hexEditor.setText ("#57D8CC");
+    hexEditor.setJustification (juce::Justification::centred);
+    hexEditor.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff0e1219));
+    hexEditor.setColour (juce::TextEditor::textColourId, juce::Colour (textColour));
+    hexEditor.setColour (juce::TextEditor::outlineColourId, juce::Colours::white.withAlpha (0.12f));
+    addAndMakeVisible (hexEditor);
+
+    presetBox.addItem ("Synthetic starter voices", 1000);
+    presetBox.addSeparator();
+
+    for (int i = 0; i < 40; ++i)
+        presetBox.addItem ("Synthetic " + juce::String (i + 1).paddedLeft ('0', 2), i + 1);
+
+    presetBox.setSelectedId (1000, juce::dontSendNotification);
+    addAndMakeVisible (presetBox);
+    addAndMakeVisible (voiceList);
+
+    for (auto* button : {
+        &importButton,
+        &generateButton,
+        &removeButton,
+        &clearButton,
+        &saveWaypointButton,
+        &previousWaypointButton,
+        &nextWaypointButton,
+        &clearWaypointsButton
+    })
+    {
+        button->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff252c38));
+        button->setColour (juce::TextButton::buttonOnColourId, juce::Colour (accentColour));
+        button->setColour (juce::TextButton::textColourOffId, juce::Colour (textColour));
+        addAndMakeVisible (*button);
+    }
+
+    importButton.onClick = [this]
+    {
+        chooseReferenceFile();
+    };
+
+    generateButton.onClick = [this]
+    {
+        auto hex = hexEditor.getText().trim();
+
+        if (! hex.startsWithChar ('#'))
+            hex = "#" + hex;
+
+        if (hex.length() != 7)
+        {
+            showStatus ("Hex voice code must look like #57D8CC");
+            return;
+        }
+
+        processor.addGeneratedVoice (
+            hex,
+            (float) voiceSpaceSlider.getValue(),
+            (float) toneSlider.getValue());
+
+        showStatus ("Generated voice " + hex);
+        updateVoiceList();
+        morphCanvas.repaint();
+    };
+
+    removeButton.onClick = [this]
+    {
+        const int index = voiceList.getSelectedId() - 1;
+        processor.removeVoice (index);
+        updateVoiceList();
+        morphCanvas.repaint();
+    };
+
+    clearButton.onClick = [this]
+    {
+        processor.clearVoices();
+        updateVoiceList();
+        morphCanvas.repaint();
+        showStatus ("Target voices cleared");
+    };
+
+    presetBox.onChange = [this]
+    {
+        const int id = presetBox.getSelectedId();
+
+        if (id >= 1 && id <= 40)
+        {
+            processor.addSyntheticPreset (id - 1);
+            updateVoiceList();
+            morphCanvas.repaint();
+            presetBox.setSelectedId (1000, juce::dontSendNotification);
+        }
+    };
+
+    saveWaypointButton.onClick = [this]
+    {
+        processor.addWaypointFromCurrent();
+        morphCanvas.repaint();
+    };
+
+    previousWaypointButton.onClick = [this]
+    {
+        processor.activatePreviousWaypoint();
+        morphCanvas.repaint();
+    };
+
+    nextWaypointButton.onClick = [this]
+    {
+        processor.activateNextWaypoint();
+        morphCanvas.repaint();
+    };
+
+    clearWaypointsButton.onClick = [this]
+    {
+        processor.clearWaypoints();
+        morphCanvas.repaint();
+    };
+
+    preGainAttachment = std::make_unique<SliderAttachment> (processor.parameters, "pregain", preGainSlider);
+    pitchAttachment = std::make_unique<SliderAttachment> (processor.parameters, "pitch", pitchSlider);
+    outputAttachment = std::make_unique<SliderAttachment> (processor.parameters, "output", outputSlider);
+    mixAttachment = std::make_unique<SliderAttachment> (processor.parameters, "mix", mixSlider);
+    radiusAttachment = std::make_unique<SliderAttachment> (processor.parameters, "radius", radiusSlider);
+    qualityAttachment = std::make_unique<ComboAttachment> (processor.parameters, "quality", qualityBox);
+    inputModeAttachment = std::make_unique<ComboAttachment> (processor.parameters, "inputMode", inputModeBox);
+    realtimeAttachment = std::make_unique<ButtonAttachment> (processor.parameters, "realtime", realtimeButton);
+    bypassAttachment = std::make_unique<ButtonAttachment> (processor.parameters, "bypass", bypassButton);
+
+    updateVoiceList();
+    startTimerHz (15);
+}
+
+MorphEditor::~MorphEditor()
+{
+    stopTimer();
+}
+
+void MorphEditor::configureSlider (juce::Slider& slider, const juce::String& suffix)
+{
+    slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
+    slider.setTextValueSuffix (suffix);
+    slider.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (accentColour));
+    slider.setColour (juce::Slider::rotarySliderOutlineColourId, juce::Colours::white.withAlpha (0.11f));
+    slider.setColour (juce::Slider::textBoxTextColourId, juce::Colour (textColour));
+    slider.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
+    slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+}
+
+void MorphEditor::chooseReferenceFile()
+{
+    chooser = std::make_unique<juce::FileChooser> (
+        "Choose a clean vocal reference",
+        juce::File {},
+        "*.wav;*.aif;*.aiff;*.flac");
+
+    const auto flags =
+        juce::FileBrowserComponent::openMode
+        | juce::FileBrowserComponent::canSelectFiles;
+
+    const juce::Component::SafePointer<MorphEditor> safe (this);
+
+    chooser->launchAsync (flags, [safe] (const juce::FileChooser& fc)
+    {
+        if (! safe)
+            return;
+
+        const auto file = fc.getResult();
+        if (! file.existsAsFile())
+            return;
+
+        juce::String error;
+
+        if (safe->processor.addVoiceFromFile (file, error))
+            safe->showStatus ("Imported " + file.getFileName());
+        else
+            safe->showStatus (error);
+
+        safe->updateVoiceList();
+        safe->morphCanvas.repaint();
+    });
+}
+
+void MorphEditor::showStatus (const juce::String& text)
+{
+    statusLabel.setText (text, juce::dontSendNotification);
+}
+
+void MorphEditor::updateVoiceList()
+{
+    const auto voices = processor.getProfilesSnapshot();
+    const int oldSelection = voiceList.getSelectedId();
+
+    voiceList.clear (juce::dontSendNotification);
+
+    for (int i = 0; i < (int) voices.size(); ++i)
+        voiceList.addItem (voices[(size_t) i].name, i + 1);
+
+    if (! voices.empty())
+    {
+        voiceList.setSelectedId (
+            juce::jlimit (1, (int) voices.size(), oldSelection > 0 ? oldSelection : 1),
+            juce::dontSendNotification);
+    }
+
+    lastVoiceCount = (int) voices.size();
+}
+
+void MorphEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (juce::Colour (0xff0b0e13));
+
+    const auto r = getLocalBounds().toFloat();
+
+    g.setColour (juce::Colour (panelColour));
+    g.fillRect (juce::Rectangle<float> (0.0f, 64.0f, 194.0f, r.getHeight() - 96.0f));
+    g.fillRect (juce::Rectangle<float> (r.getWidth() - 214.0f, 64.0f, 214.0f, r.getHeight() - 96.0f));
+
+    g.setColour (juce::Colours::white.withAlpha (0.07f));
+    g.drawHorizontalLine (63, 0.0f, r.getWidth());
+    g.drawHorizontalLine ((int) r.getHeight() - 32, 0.0f, r.getWidth());
+
+    g.setColour (juce::Colour (mutedColour));
+    g.setFont (11.0f);
+
+    g.drawText ("PRE GAIN", 18, 83, 76, 18, juce::Justification::centred);
+    g.drawText ("PITCH", 100, 83, 76, 18, juce::Justification::centred);
+    g.drawText ("OUTPUT", 18, 208, 76, 18, juce::Justification::centred);
+    g.drawText ("MIX", 100, 208, 76, 18, juce::Justification::centred);
+    g.drawText ("INFLUENCE", 59, 333, 78, 18, juce::Justification::centred);
+
+    const int rightX = getWidth() - 198;
+
+    g.drawText ("GENERATED VOICE", rightX, 84, 180, 18, juce::Justification::centredLeft);
+    g.drawText ("VOICE CODE", rightX, 112, 180, 18, juce::Justification::centredLeft);
+    g.drawText ("VOICE SPACE", rightX, 170, 80, 18, juce::Justification::centred);
+    g.drawText ("TONE", rightX + 92, 170, 80, 18, juce::Justification::centred);
+    g.drawText ("TARGET VOICES", rightX, 330, 180, 18, juce::Justification::centredLeft);
+
+    const float in = juce::jlimit (0.0f, 1.0f, processor.getInputMeter());
+    const float out = juce::jlimit (0.0f, 1.0f, processor.getOutputMeter());
+
+    const auto meterArea = juce::Rectangle<float> (
+        (float) getWidth() - 156.0f,
+        19.0f,
+        138.0f,
+        9.0f);
+
+    g.setColour (juce::Colours::white.withAlpha (0.08f));
+    g.fillRoundedRectangle (meterArea, 4.0f);
+    g.fillRoundedRectangle (meterArea.translated (0.0f, 14.0f), 4.0f);
+
+    g.setColour (juce::Colour (accentColour));
+    g.fillRoundedRectangle (meterArea.withWidth (meterArea.getWidth() * in), 4.0f);
+
+    g.setColour (juce::Colour (0xff9db6ff));
+    g.fillRoundedRectangle (
+        meterArea.translated (0.0f, 14.0f).withWidth (meterArea.getWidth() * out),
+        4.0f);
+}
+
 void MorphEditor::resized()
 {
-    bypass.setBounds(586,24,100,30);settings.setBounds(526,764,162,28);
-    modelLabel.setBounds(72,309,576,30);model.setBounds(220,351,280,38);
-    import.setBounds(32,586,134,38);record.setBounds(178,586,134,38);transform.setBounds(324,586,222,38);reset.setBounds(558,586,130,38);
-    mix.setBounds(543,636,140,113);pitch.setBounds(112,653,390,40);
-    preview.setBounds(32,710,138,34);save.setBounds(182,710,138,34);
-    statusLabel.setBounds(32,763,472,37);
+    const int w = getWidth();
+    const int h = getHeight();
+
+    titleLabel.setBounds (18, 10, 220, 28);
+    subtitleLabel.setBounds (18, 35, 280, 18);
+
+    bypassButton.setBounds (w - 520, 18, 88, 28);
+    realtimeButton.setBounds (w - 430, 18, 92, 28);
+    qualityBox.setBounds (w - 334, 17, 145, 30);
+    latencyLabel.setBounds (w - 182, 17, 160, 30);
+
+    statusLabel.setBounds (18, h - 30, w - 36, 24);
+
+    preGainSlider.setBounds (14, 101, 82, 102);
+    pitchSlider.setBounds (98, 101, 82, 102);
+    outputSlider.setBounds (14, 226, 82, 102);
+    mixSlider.setBounds (98, 226, 82, 102);
+    radiusSlider.setBounds (56, 351, 84, 102);
+
+    inputModeBox.setBounds (18, 468, 158, 28);
+    importButton.setBounds (18, 510, 158, 32);
+    presetBox.setBounds (18, 550, 158, 28);
+    saveWaypointButton.setBounds (18, 590, 102, 30);
+    previousWaypointButton.setBounds (124, 590, 24, 30);
+    nextWaypointButton.setBounds (152, 590, 24, 30);
+    clearWaypointsButton.setBounds (18, 626, 158, 28);
+
+    const int rx = w - 198;
+
+    hexEditor.setBounds (rx, 132, 180, 30);
+    voiceSpaceSlider.setBounds (rx, 190, 82, 108);
+    toneSlider.setBounds (rx + 92, 190, 82, 108);
+    generateButton.setBounds (rx, 294, 180, 32);
+    voiceList.setBounds (rx, 350, 180, 30);
+    removeButton.setBounds (rx, 390, 86, 30);
+    clearButton.setBounds (rx + 94, 390, 86, 30);
+
+    morphCanvas.setBounds (194, 64, w - 194 - 214, h - 96);
 }
-void MorphEditor::paint(juce::Graphics& g)
-{
-    g.fillAll(ink);
-    g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1b3440),360,160,ink,360,550,true));g.fillRect(getLocalBounds());
-    g.setColour(juce::Colour(0xffeaf3f2));g.setFont(juce::FontOptions(27.0f,juce::Font::bold));g.drawText("METAMORPH",32,22,370,35,juce::Justification::centredLeft);
-    g.setColour(muted);g.setFont(11.0f);g.drawText("REBUILD  /  OFFLINE VOICE TRANSFORMATION",33,60,490,18,juce::Justification::centredLeft);
-    const auto centre=juce::Point<float>(360,198);
-    for(int i=0;i<6;++i){g.setColour(mint.withAlpha(.035f+.012f*i));const float radius=108.0f-i*5;g.drawEllipse(centre.x-radius,centre.y-radius,radius*2,radius*2,1.0f);}
-    g.setColour(juce::Colour(0xff101e26));g.fillEllipse(278,116,164,164);
-    g.setColour(mint.withAlpha(.5f));g.drawEllipse(278,116,164,164,1.2f);
-    for(int i=0;i<29;++i)
-    {
-        const float x=296+i*4.6f,phase=(float)i*.58f;
-        const float shape=std::sin((float)i/28.0f*juce::MathConstants<float>::pi);
-        const float height=10+shape*(25+19*std::sin(phase)*std::sin(phase)+juce::jmin(.6f,processor.level())*75);
-        g.setColour(mint.withAlpha(.5f+.5f*shape));g.fillRoundedRectangle(x,198-height*.5f,2.6f,height,1.3f);
-    }
-    g.setColour(muted);g.setFont(12.0f);g.drawText("YOUR VOICE MODEL",180,282,360,20,juce::Justification::centred);
-    juce::Rectangle<float> wave(32,414,656,142);
-    g.setColour(juce::Colour(0xff101b24));g.fillRoundedRectangle(wave,12);
-    g.setColour(juce::Colour(0xff2b3b45));g.drawRoundedRectangle(wave,12,1);
-    g.setColour(muted);g.setFont(11.0f);g.drawText("RECORDING",48,425,150,20,juce::Justification::centredLeft);
-    g.drawText(juce::String(processor.duration(),1)+" s / 180 s",450,425,220,20,juce::Justification::centredRight);
-    const auto values=processor.waveform();g.setColour(processor.isArmed()?juce::Colour(0xffff8e9c):mint);
-    for(int i=0;i<256;++i){const float h=juce::jmax(1.0f,juce::jmin(1.0f,values[(size_t)i])*72);g.fillRect(48+i*2.43f,498-h*.5f,1.3f,h);}
-    if(!processor.hasAudio()){g.setColour(muted);g.setFont(14.0f);g.drawText("Record your vocal track or drop an audio file here",80,519,560,24,juce::Justification::centred);}
-    g.setColour(muted);g.setFont(12.0f);g.drawText("PITCH",32,660,80,25,juce::Justification::centredLeft);g.drawText("DRY / WET",538,743,150,18,juce::Justification::centred);
-    g.setColour(juce::Colour(0xff293b43));g.fillRoundedRectangle(32,567,656,4,2);
-    if(processor.completion()>0){g.setColour(mint);g.fillRoundedRectangle(32,567,656*processor.completion(),4,2);}
-}
+
 void MorphEditor::timerCallback()
 {
-    const bool busy=processor.isBusy();
-    model.setEnabled(!busy);import.setEnabled(!busy);record.setEnabled(!busy);reset.setEnabled(!busy);settings.setEnabled(!busy);
-    transform.setButtonText(busy?"Cancel":"Transform");transform.setEnabled(busy||processor.hasAudio());
-    preview.setEnabled(!busy&&processor.hasAudio()&&!processor.isArmed());save.setEnabled(!busy&&processor.hasAudio()&&!processor.isArmed());
-    record.setButtonText(processor.isArmed()?"Stop recording":"Record");preview.setButtonText(processor.isPreviewing()?"Stop preview":"Preview");
-    statusLabel.setText(processor.status(),juce::dontSendNotification);
-    modelLabel.setText(processor.modelName().isEmpty()?"A new voice starts here":processor.modelName(),juce::dontSendNotification);repaint();
+    const auto count = (int) processor.getProfilesSnapshot().size();
+
+    if (count != lastVoiceCount)
+        updateVoiceList();
+
+    const int quality = (int) processor.parameters.getRawParameterValue ("quality")->load();
+    static constexpr int latencies[] { 35, 50, 95, 105 };
+
+    latencyLabel.setText (
+        "mode " + juce::String (latencies[juce::jlimit (0, 3, quality)]) + " ms",
+        juce::dontSendNotification);
+
+    morphCanvas.repaint();
+    repaint();
 }
-void MorphEditor::choose(int kind)
-{
-    const juce::String titles[]={"Choose an RVC .pth voice model","Import vocal audio","Export audio","Choose the bundled Resources folder"};
-    const juce::String filters[]={"*.pth","*.wav;*.aif;*.aiff;*.flac","*.wav","*"};
-    chooser=std::make_unique<juce::FileChooser>(titles[kind],juce::File{},filters[kind]);
-    int flags=kind==2?juce::FileBrowserComponent::saveMode|juce::FileBrowserComponent::canSelectFiles|juce::FileBrowserComponent::warnAboutOverwriting:juce::FileBrowserComponent::openMode|(kind==3?juce::FileBrowserComponent::canSelectDirectories:juce::FileBrowserComponent::canSelectFiles);
-    const juce::Component::SafePointer<MorphEditor> safe(this);
-    chooser->launchAsync(flags,[safe,kind](const juce::FileChooser& c){if(!safe)return;const auto f=c.getResult();if(f==juce::File{})return;
-        if(kind==0)safe->processor.setModel(f);else if(kind==1)safe->processor.importAudio(f);else if(kind==2)safe->processor.exportAudio(f.withFileExtension("wav"));else safe->processor.setResources(f);});
-}
-bool MorphEditor::isInterestedInFileDrag(const juce::StringArray& files){return files.size()==1 && juce::File(files[0]).hasFileExtension("pth;wav;aif;aiff;flac");}
-void MorphEditor::filesDropped(const juce::StringArray& files,int,int){if(files.size()!=1)return;const juce::File f(files[0]);if(f.hasFileExtension("pth"))processor.setModel(f);else processor.importAudio(f);}
